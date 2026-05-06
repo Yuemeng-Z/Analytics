@@ -25,3 +25,4 @@ These files are not imported by the recent Affirm or Project Driver notebooks, b
 
 - Several workflows still read deal source files from external `F:\...` paths.
 - Some files with an `.xlsx` extension are older Excel/OLE workbooks, so `openpyxl` may not be able to inspect them even if Excel can open them.
+- Data files and generated workbooks are intentionally ignored by Git. See `DATA_ORGANIZATION.md` and `data_manifest.md` for the recommended local data layout and current workbook inventory.

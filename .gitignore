@@ -2,6 +2,20 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 
+# Data, workbooks, and generated outputs are intentionally kept out of Git.
+*.xlsx
+*.xlsm
+*.xls
+*.xlsb
+*.csv
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.zip
+*.pdf
+*.msg
+
 # Excel/Office lock files
 ~$*.xlsx
 ~$*.xlsm
@@ -11,4 +25,8 @@ __pycache__/
 .vscode/
 
 # Runtime logs/scratch outputs
+*.log
 output.txt
+pipeline_outputs.xlsx
+Outputs/
+outputs/
