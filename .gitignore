@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Excel/Office lock files
+~$*.xlsx
+~$*.xlsm
+~$*.xls
+
+# Local editor state
+.vscode/
+
+# Runtime logs/scratch outputs
+output.txt
