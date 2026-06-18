@@ -1,0 +1,179 @@
+SET NOCOUNT ON;
+
+/* Define Default Amount and Dates for each loan ID */
+DROP TABLE IF EXISTS #dflt
+DROP TABLE IF EXISTS #dflt_help
+DROP TABLE IF EXISTS #dflt_help_2
+DROP TABLE IF EXISTS #cleanTable
+DROP TABLE IF EXISTS #ORIG
+
+SELECT 
+		UNIQUE_ID
+	,	RPT_DATE AS default_month 
+	,	DEAL
+	,	IDNUMBER
+INTO #dflt_help FROM (
+    SELECT
+        UNIQUE_ID,
+		IDNUMBER,
+        RPT_DATE,
+        CURBALANCE,
+		ACCUMLOSS_AMT,
+		DEAL,
+        ROW_NUMBER() OVER (
+            PARTITION BY UNIQUE_ID
+            ORDER BY RPT_DATE 
+        ) AS rn
+	FROM [ConsumerLoans].[dbo].[MH_Deal_Performance]
+    WHERE MONTHS_DELINQ >= 6
+) t
+WHERE rn = 1
+
+
+SELECT 
+		UNIQUE_ID 
+	,	RPT_DATE AS default_month
+	,	DEAL
+	,	IDNUMBER
+INTO #dflt_help_2 FROM (
+    SELECT
+        UNIQUE_ID,
+        RPT_DATE,
+        CURBALANCE,
+		ACCUMLOSS_AMT,
+		DEAL,
+		IDNUMBER,
+        ROW_NUMBER() OVER (
+            PARTITION BY UNIQUE_ID
+            ORDER BY RPT_DATE 
+        ) AS rn
+	FROM [ConsumerLoans].[dbo].[MH_Deal_Performance]
+    WHERE ACCUMLOSS_AMT > 0
+) t
+WHERE rn = 1
+
+/*
+SELECT UNIQUE_ID, default_month FROM #dflt_help 
+UNION ALL 
+SELECT UNIQUE_ID, default_month FROM #dflt_help_2
+*/
+
+SELECT *
+INTO #dflt
+FROM (
+    SELECT
+        h.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY UNIQUE_ID
+            ORDER BY default_month
+        ) AS rn
+    FROM 
+	(SELECT UNIQUE_ID, DEAL, IDNUMBER, default_month FROM #dflt_help 
+	UNION ALL 
+	SELECT UNIQUE_ID, DEAL, IDNUMBER, default_month FROM #dflt_help_2) h
+) x
+WHERE rn = 1;
+
+/* Define Orig Table */
+SELECT * INTO #ORIG
+FROM
+(
+	SELECT 
+				c.UNIQUE_ID
+			,	c.DEAL
+			,	c.IDNUMBER
+			,	c.RPT_DATE
+			,	c.CURBALANCE AS EOM_bal_first_payment_date
+			,	CASE WHEN AGE <= 6 THEN '1_age_mos_at_close_1-6'
+				 WHEN AGE>= 7 AND AGE <= 12 THEN '2_age_mos_at_close_7-12'
+				 WHEN AGE>= 13 AND AGE <= 24 THEN '3_age_mos_at_close_13_24'
+				 WHEN AGE>= 25 AND AGE <= 60 THEN '4_age_GT_2_to_5_Yrs'
+				 WHEN AGE >= 61 THEN '5_age_at_close_GT_5_Yrs'
+				ELSE NULL END
+				AS Age_Bucket
+			,	AGE as Loan_Age_at_Deal_close
+			,	CASE WHEN FICO < 620 OR FICO IS NULL THEN '1_<620 OR No FICO'
+					 WHEN FICO >= 620 AND FICO < 650 THEN '2_620 - 649'
+					 WHEN FICO >= 650 AND FICO < 680 THEN '3_650 - 679'
+					 WHEN FICO >= 680 AND FICO < 700 THEN '4_680 - 700'
+					 WHEN FICO >= 700 AND FICO < 740 THEN '5_700 - 740'
+					 WHEN FICO >= 740 AND FICO < 775 THEN '6_740 - 775'
+					 WHEN FICO > 775 THEN '7_>775'
+				ELSE 'Other' END AS FICO_bkt
+		FROM [ConsumerLoans].[dbo].[MH_Deal_Performance] c
+		WHERE (c.DEAL = 'CMHA19M1' AND c.RPT_DATE = '2019-11-25')
+				OR (c.DEAL = 'CMHA22M1' AND c.RPT_DATE = '2022-08-25')
+				OR (c.DEAL = 'CMHA24M1' AND c.RPT_DATE = '2024-10-25')
+				OR (c.DEAL = 'TWPT19M1' AND c.RPT_DATE = '2019-10-25')
+				OR (c.DEAL = 'TWPT20M1' AND c.RPT_DATE = '2020-03-25')
+) t_orig
+
+/* Define Table */
+
+SELECT 
+		*
+	,	Expected_Payment - Expected_Interest AS Expected_Prin
+	,	CASE WHEN RPT_DATE <= default_month OR default_month IS NULL THEN BOM_BAL ELSE 0 END BOM_BAL_clean
+	,	CASE WHEN RPT_DATE < default_month OR default_month IS NULL THEN CURBALANCE ELSE 0 END AS CURBALANCE_clean
+INTO #cleanTable FROM
+(
+	SELECT 
+			a.*
+		,	default_month
+		,	CASE WHEN a.DEAL = 'CMHA19M1' THEN DATEDIFF(MONTH, '2019-11-25', a.RPT_DATE) + 1
+				 WHEN a.DEAL = 'CMHA22M1' THEN DATEDIFF(MONTH, '2022-08-25', a.RPT_DATE) + 1
+				 WHEN a.DEAL = 'CMHA24M1' THEN DATEDIFF(MONTH, '2024-10-25', a.RPT_DATE) + 1
+				 WHEN a.DEAL = 'TWPT19M1' THEN DATEDIFF(MONTH, '2019-10-25', a.RPT_DATE) + 1
+				 WHEN a.DEAL = 'TWPT20M1' THEN DATEDIFF(MONTH, '2020-03-25', a.RPT_DATE) + 1
+			ELSE NULL END 
+			AS months_since_deal_clost
+
+		,	CASE WHEN a.DEAL = 'CMHA19M1' THEN
+					(CASE WHEN a.UNIQUE_ID IN
+						(
+							SELECT UNIQUE_ID
+							FROM [ConsumerLoans].[dbo].[MH_Deal_Performance]
+							WHERE 
+								DEAL = 'CMHA19M1'
+							and rpt_Date='20260425'
+							and ai_appR_VALUE_orig>0
+							/* For CMHA19M1, all the loans with >0 AI_APPR_VALUE_ORIG in the last snapshot are land home loans. */
+						) THEN 'Land Home' ELSE 'Chattel' END)
+				 WHEN a.DEAL = 'CMHA22M1' THEN (CASE WHEN a.PROPCODE = 'Chattel' THEN 'Chattel' ELSE 'Land Home' END) 
+				 WHEN a.DEAL = 'CMHA24M1' THEN (CASE WHEN a.ORIGAMORBALLN < 360 THEN 'Chattel' ELSE 'Land Home' END)
+				 WHEN a.DEAL = 'TWPT20M1' THEN (CASE WHEN PROPCODE = 'Other/Unknown' THEN 'Chattel' ELSE 'Land Home' END)
+			ELSE NULL END 
+			AS Loan_Type
+		,	CASE WHEN a.DELINQ IS NOT NULL THEN a.CURBALANCE ELSE 0 END AS nonperforming_bal
+		,	CASE WHEN a.RPT_DATE = b.default_month THEN a.BOM_BAL ELSE 0 END AS default_amount
+		,	CASE WHEN a.RPT_DATE >= b.default_month THEN 1 ELSE 0 END AS is_default
+		,	CASE WHEN (a.RPT_DATE < b.default_month OR default_month IS NULL) AND a.MONTHS_DELINQ >= 1 THEN a.BOM_BAL ELSE 0 END AS delin_amount
+		,	e.Age_Bucket
+		,	e.EOM_bal_first_payment_date
+		,	e.Loan_Age_at_Deal_close
+		,	e.FICO_bkt
+		,	CASE WHEN REMAMORBALLN >= 1 AND a.BOM_BAL > 0 AND ((a.RPT_DATE < b.default_month) OR b.default_month IS NULL)
+			THEN (a.BOM_BAL * (a.GROSSCOUPON / 1200))/ NULLIF((1 - POWER(1+a.GROSSCOUPON / 1200, -REMAMORBALLN)), 0) 
+			ELSE 0 END AS Expected_Payment
+		,	CASE WHEN REMAMORBALLN >= 1 AND a.GROSSCOUPON > 0 AND a.BOM_BAL > 0 AND (a.RPT_DATE < b.default_month OR b.default_month IS NULL)
+			THEN a.BOM_BAL * (a.GROSSCOUPON / 1200) ELSE 0 END AS Expected_Interest
+	FROM 
+		(SELECT 
+				c.*
+			,	d.CURBALANCE AS BOM_BAL
+		FROM [ConsumerLoans].[dbo].[MH_Deal_Performance] c
+		LEFT JOIN [ConsumerLoans].[dbo].[MH_Deal_Performance] d
+		ON c.IDNUMBER = d.IDNUMBER
+		AND c.DEAL = d.DEAL
+		AND c.RPT_DATE = DATEADD(MONTH, 1, d.RPT_DATE)
+		) a
+	LEFT JOIN
+		#dflt b
+	ON a.IDNUMBER = b.IDNUMBER
+	AND a.DEAL = b.DEAL
+--	AND a.RPT_DATE = b.default_month
+	LEFT JOIN
+		#ORIG e
+	ON a.IDNUMBER = e.IDNUMBER 
+	AND a.DEAL = e.DEAL
+) t
