@@ -9,8 +9,17 @@ Python notebooks and supporting workbooks for deal analytics.
 
 ## Shared Code
 
-- `parentHelpers.py` - plotting, formatting, weighted-average, and vintage-analysis helpers used by the recent notebooks.
+- `loanPipelineHelpers.py` - quiet reusable pipeline helpers for reading tabular files, standardizing columns, quality checks, loan/performance merges, panel shaping, target creation, and performance rollups.
+- `parentHelpers.py` - notebook-facing helpers for display, formatting, plotting, Data Wrangler convenience loading, and shared exploratory deal-review tables.
 - `regression.py` - current shared regression pipeline used by the recent notebooks.
+- `helperProjectDriver.py` - Project Driver / Recreation Vehicles-specific curve, payment, prepayment, and cleanup helpers.
+
+Rule of thumb for adding new helpers:
+
+- Put reusable loan tape transformations in `loanPipelineHelpers.py`.
+- Put notebook display, plotting, and presentation formatting in `parentHelpers.py`.
+- Put model training or coefficient/diagnostic logic in `regression.py`.
+- Put one-deal-only assumptions or cleanup in that deal's helper file.
 
 ## Legacy Candidates
 

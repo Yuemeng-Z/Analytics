@@ -1,3 +1,11 @@
+"""
+Regression and model-review helpers.
+
+Keep sklearn transformers, model training, model diagnostics, coefficient
+summaries, category reduction, and regression plotting here. Data reading and
+loan tape preparation belong in loanPipelineHelpers.py.
+"""
+
 import numpy as np
 import pandas as pd
 
@@ -529,7 +537,7 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
 
         for var, drop_col in spline_drop.items():
             # find drop_col in feature_names
-            center = float(drop_col.split("_")[1])
+            center = float(drop_col.rsplit("_", 2)[1])
             breaks = spline_features[var]
             knots = [-np.inf] + breaks + [np.inf]
 

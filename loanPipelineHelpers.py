@@ -1,3 +1,11 @@
+"""
+Core loan data pipeline helpers.
+
+Put reusable file reading, standardization, validation, merging, panel shaping,
+target creation, and loan performance rollups here. These helpers should stay
+quiet: return DataFrames/objects without notebook display side effects.
+"""
+
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +100,13 @@ def weighted_missing_rate(series, weights):
     if not mask.any():
         return np.nan
     return weights[mask & series.isna()].sum() / weights[mask].sum()
+
+
+def trim_last_n(col, n=3):
+    mask = col.notna()
+    idx = col.index[mask]
+    col.loc[idx[-n:]] = float("nan")
+    return col
 
 
 def data_quality_report(df, required_cols=None, weight_col=None):
@@ -639,3 +654,11 @@ def performance_rollup(
         grouped["dq30_pct"] = grouped["dq30_balance"] / grouped["current_balance"]
 
     return grouped
+
+
+def create_vintage(origination_raw, origination_date_col):
+    origination_raw[origination_date_col] = pd.to_datetime(origination_raw[origination_date_col], errors='coerce')
+    origination_raw['Origination Month'] = origination_raw[origination_date_col].dt.to_period('M')
+    origination_raw['Origination Quarter'] = origination_raw[origination_date_col].dt.to_period('Q')
+
+    return origination_raw

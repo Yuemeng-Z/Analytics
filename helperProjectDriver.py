@@ -1,7 +1,15 @@
+"""
+Project Driver / Recreation Vehicles deal-specific helper functions.
+
+Keep reusable deal quirks, curve extrapolation, and field-specific cleanup here.
+Generic pipeline utilities belong in loanPipelineHelpers.py and shared notebook
+plotting/formatting belongs in parentHelpers.py.
+"""
+
 import numpy as np
 import pandas as pd
 
-from parentHelpers import trim_last_n
+from loanPipelineHelpers import trim_last_n
 
 
 def calc_payment_from_current_balance(balance, r, remaining_term):
