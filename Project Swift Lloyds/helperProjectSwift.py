@@ -1,0 +1,461 @@
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
+EMPLOYMENT_STATUS_BUCKETS = {
+    "EMRS": "EMRS - Employed, private sector",
+    "EMBL": "EMBL - Employed, public sector",
+    "EMUK": "EMUK - Employed, sector unknown",
+    "UNEM": "UNEM - Unemployed",
+    "SFEM": "SFEM - Self-employed",
+    "SFE": "SFE - Self-employed",
+    "NOEM": "NOEM - No employment, legal entity obligor",
+    "STNT": "STNT - Student",
+    "PNNR": "PNNR - Pensioner",
+    "OTHR": "OTHR - Other",
+}
+
+ORIGINATION_CHANNEL_BUCKETS = {
+    "WEBI": "WEBI - Internet",
+    "BRCH": "BRCH - Branch",
+    "TLSL": "TLSL - Telesale",
+    "STND": "STND - Stand",
+    "POST": "POST - Post",
+    "WLBL": "WLBL - White Label",
+    "MGZN": "MGZN - Magazine",
+    "ADLR": "ADLR - Automobile Dealer",
+    "OTHR": "OTHR - Other",
+}
+
+PURPOSE_BUCKETS = {
+    "TUIT": "TUIT - Tuition",
+    "LEXP": "LEXP - Living Expenses",
+    "MDCL": "MDCL - Medical",
+    "HIMP": "HIMP - Home Improvement",
+    "APFR": "APFR - Appliance or Furniture",
+    "TRVL": "TRVL - Travel",
+    "DCON": "DCON - Debt Consolidation",
+    "NCAR": "NCAR - New Car",
+    "UCAR": "UCAR - Used Car",
+    "OTHV": "OTHV - Other Vehicle",
+    "EQUP": "EQUP - Equipment",
+    "PROP": "PROP - Property",
+    "OTHR": "OTHR - Other",
+}
+
+RESIDENT_BUCKETS = {
+    "1": "1 - Resident less than 3 years",
+    "2": "2 - Resident >= 3 years",
+    "3": "3 - Not Resident",
+    "ND": "ND - No Data",
+}
+
+
+def _map_code_bucket(series, mapping, unknown_label):
+    code = series.astype("string").str.strip().str.upper().str.replace(r"\.0$", "", regex=True)
+    unknown_code = code.where(code.isna(), code + f" - {unknown_label}")
+
+    return code.map(mapping).fillna(unknown_code)
+
+
+def _format_region_label(value):
+    if pd.isna(value):
+        return value
+
+    text = str(value).strip()
+    abbreviations = {"NE", "NW", "SE", "SW", "UK", "GB", "NI"}
+
+    return " ".join(
+        part.upper() if part.upper() in abbreviations else part.lower().title()
+        for part in text.split("_")
+    )
+
+
+def add_employment_status_bucket(df):
+    if "Employment_Status" not in df.columns:
+        return df.copy()
+
+    result = df.copy()
+    result["Employment_Status_Bucket"] = _map_code_bucket(
+        result["Employment_Status"],
+        EMPLOYMENT_STATUS_BUCKETS,
+        "Unknown employment status code",
+    )
+
+    return result
+
+
+def add_readable_category_buckets(df):
+    result = add_employment_status_bucket(df)
+
+    if "Origination_Channel" in result.columns:
+        result["Origination_Channel_Bucket"] = _map_code_bucket(
+            result["Origination_Channel"],
+            ORIGINATION_CHANNEL_BUCKETS,
+            "Unknown origination channel code",
+        )
+
+    if "Purpose" in result.columns:
+        result["Purpose_Bucket"] = _map_code_bucket(
+            result["Purpose"],
+            PURPOSE_BUCKETS,
+            "Unknown purpose code",
+        )
+
+    if "Loan_Purpose_Mapped" in result.columns:
+        result["Loan_Purpose_Mapped_Bucket"] = _map_code_bucket(
+            result["Loan_Purpose_Mapped"],
+            PURPOSE_BUCKETS,
+            "Unknown purpose code",
+        )
+
+    if "Resident" in result.columns:
+        result["Resident_Bucket"] = _map_code_bucket(
+            result["Resident"],
+            RESIDENT_BUCKETS,
+            "Unknown resident code",
+        )
+
+    if "Post Code Region Application" in result.columns:
+        result["Post Code Region Application_Bucket"] = (
+            result["Post Code Region Application"].map(_format_region_label)
+        )
+
+    return result
+
+
+def clean_loan_tape(LoanTape):
+
+    print('Duplicated Loan Count: ',
+      LoanTape.shape[0] - LoanTape['New_Underlying_Exposure_Identifier'].nunique()
+     )
+
+    LoanTape = LoanTape.drop_duplicates(
+        subset=['New_Underlying_Exposure_Identifier'],
+        keep='first'
+    )
+
+    print('Final Loan Tape Shape: ', LoanTape.shape)
+
+    LoanTape = LoanTape[['EverD60CO_Mar2026',
+                     'EverD60CO_Sep2025',
+                    'New_Underlying_Exposure_Identifier',
+                    'Employment_Status',
+                    'Credit_Impaired_Obligor',
+                    'Primary_Income',
+                    'Origination_Channel',
+                    'Purpose',
+                    'Origination_Date',
+                    'Original_Term',
+                    'Original_Principal_Balance',
+                    'Current_Interest_Rate',
+                    'Borrower Credit Quality',
+                    'Number of Borrowers',
+                    'Resident',
+                    'Bureau Score Value',
+                    'STAGE',
+                    'AGE',
+                    'Post Code Region Application',
+                    'Set off amount',
+                    'Loan_Purpose_Mapped',
+                    'LoanAgeDec2023',
+                    'Dec2023Bal'
+                ]]
+
+    LoanTape = add_readable_category_buckets(LoanTape)
+    # print('Added readable category buckets.', LoanTape.columns)
+    
+    LoanTape['Origination_Date'] = pd.to_datetime(LoanTape['Origination_Date'], errors='coerce')
+
+    LoanTape['Origination_Quarter'] = (
+        LoanTape['Origination_Date'].dt.to_period('Q').astype(str)
+    )
+
+
+    quarter_avg_rate = (
+        LoanTape
+        .groupby('Origination_Quarter')
+        .apply(lambda g: np.average(g['Current_Interest_Rate'], 
+                                    weights=g['Dec2023Bal']))
+        .rename('weighted_quarter_rate')
+        .reset_index()
+    )
+
+    # Merge back to original LoanTape
+    LoanTape = LoanTape.merge(quarter_avg_rate, on='Origination_Quarter', how='left')
+
+    LoanTape['normalized_interest_rate'] = (
+        LoanTape['Current_Interest_Rate'] - LoanTape['weighted_quarter_rate']
+    )
+
+
+    r = LoanTape['Current_Interest_Rate'] / 100 / 12
+    n = LoanTape['Original_Term']
+    bal = LoanTape['Original_Principal_Balance']
+
+    # Monthly payment formula, with zero-rate handling
+    LoanTape['MonthlyPayment'] = np.where(
+        r == 0,
+        bal / n,                                       # zero-interest case
+        r * bal / (1 - (1 + r)**(-n))                  # standard amortization
+    )
+
+    LoanTape['PTI'] = LoanTape['MonthlyPayment'] / LoanTape['Primary_Income'] * 12 * 100
+
+    LoanTape['Self_Employed_or_Not'] = LoanTape['Employment_Status'].apply(lambda x: 'Yes' if x == 'SFEM' else 'No')
+    LoanTape['Loan_Purpose'] = LoanTape['Purpose_Bucket'].apply(lambda x: x if x in ['OTHV - Other Vehicle', 'HIMP - Home Improvement'] 
+                                                                else 'Debt Consolidation, Travel or Other')
+    LoanTape['Region'] = LoanTape['Post Code Region Application_Bucket'].apply(lambda x: x if x in ['London'] 
+                                                                                else 'Outside London')
+        
+    return LoanTape
+
+
+def plot_everD60_by_features(df, everD60_col='EverD60CO_Mar2026'):
+    df = add_readable_category_buckets(df)
+    
+    cols = [
+        everD60_col,
+        "Employment_Status_Bucket",
+        'Self_Employed_or_Not',
+
+        "Credit_Impaired_Obligor",
+        "Primary_Income",
+        "Origination_Channel_Bucket",
+        "Purpose_Bucket",
+        "Loan_Purpose",
+        "Origination_Date",
+        "Original_Term",
+        "Original_Principal_Balance",
+        "normalized_interest_rate",
+        "Borrower Credit Quality",
+        "Number of Borrowers",
+        "Resident_Bucket",
+        "Bureau Score Value",
+        'Set off amount',
+        "STAGE",
+        "AGE",
+        "Post Code Region Application_Bucket",
+        "Region",
+        # "Loan_Purpose_Mapped_Bucket",
+        "LoanAgeDec2023",
+        "Dec2023Bal",
+        "Original_Principal_Balance",
+        'PTI',
+        'MonthlyPayment',
+        'Primary_Income',
+        'LoanAgeDec2023'
+    ]
+
+    for col in cols:
+        # if col not in df.columns or col in ["EverD60CO", "Dec2023Bal"]:
+        if col not in df.columns or col in [everD60_col]:
+            continue
+
+        display_col = col.replace("_Bucket", "").replace("_", " ")
+        s = df[col]
+        n_unique = s.nunique(dropna=True)
+        is_categorical = (s.dtype == "object") or (s.dtype.name == "category")
+
+        # ---------- CASE 1: categorical or <= 10 unique values ----------
+        if is_categorical or n_unique <= 10:
+            grouped = df.groupby(col, dropna=False, sort=False)
+            pct = grouped.apply(
+                lambda g: g.loc[g[everD60_col] == 1, "Dec2023Bal"].sum() / g["Dec2023Bal"].sum()
+                if g["Dec2023Bal"].sum() != 0 else 0
+            )
+            counts = grouped.size()
+
+            plt.figure(figsize=(11, 5))
+            ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
+            ymax = pct.max() if len(pct) else 0
+            ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
+            ax.set_ylabel("DQ60/CO% of orig bal\n(defined as Dec-2023 balance) as of 3/31/2026")
+            ax.set_xlabel("")
+            ax.set_title(f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
+            ax.grid(axis="y", linestyle="--", alpha=0.35)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
+
+            # Add sample size above bars
+            for i, value in enumerate(pct):
+                ax.text(
+                    i,
+                    value + (ymax * 0.03 if ymax > 0 else 0.002),
+                    f"{value:.1%}\nn={counts.iloc[i]:,}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+            plt.show()
+
+        # ---------- CASE 2: numeric with > 10 values ----------
+        else:
+            numeric_s = pd.to_numeric(s, errors="coerce")
+            valid = df[numeric_s.notna()].copy()
+            numeric_s = numeric_s[numeric_s.notna()]
+
+            if numeric_s.nunique() == 0:
+                continue
+
+            try:
+                bins = pd.qcut(numeric_s, q=10, duplicates="drop")
+            except ValueError:
+                bins = pd.cut(numeric_s, bins=10)
+
+            valid["_bin"] = bins
+
+            grouped = valid.groupby("_bin", dropna=False)
+            pct = grouped.apply(
+                lambda g: g.loc[g[everD60_col] == 1, "Dec2023Bal"].sum() / g["Dec2023Bal"].sum()
+                if g["Dec2023Bal"].sum() != 0 else 0
+            )
+            counts = grouped.size()
+
+            plt.figure(figsize=(11, 5))
+            ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
+            ymax = pct.max() if len(pct) else 0
+            ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
+            ax.set_ylabel("DQ60/CO% of orig bal\n(defined as Dec-2023 balance) as of 3/31/2026")
+            ax.set_xlabel("")
+            ax.set_title(f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
+            ax.grid(axis="y", linestyle="--", alpha=0.35)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
+
+            # Add sample size text
+            for i, value in enumerate(pct):
+                ax.text(
+                    i,
+                    value + (ymax * 0.03 if ymax > 0 else 0.002),
+                    f"{value:.1%}\nn={counts.iloc[i]:,}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+            plt.show()
+
+
+def make_balance_deciles(df, score_col, bal_col, bad_col, n_deciles=10):
+        df_sorted = df.sort_values(score_col, ascending=True).copy()
+        
+        df_sorted['cum_bal'] = df_sorted[bal_col].cumsum()
+        total_bal = df_sorted[bal_col].sum()
+        df_sorted['bal_pct'] = df_sorted['cum_bal'] / total_bal
+        
+        df_sorted['decile'] = np.ceil(df_sorted['bal_pct'] * n_deciles).astype(int)
+        df_sorted.loc[df_sorted['decile'] < 1, 'decile'] = 1
+        df_sorted.loc[df_sorted['decile'] > n_deciles, 'decile'] = n_deciles
+        
+        agg = (
+            df_sorted
+            .groupby('decile')
+            .apply(lambda d: pd.Series({
+                'Total_Bal': d[bal_col].sum(),
+                'Bad_Bal': d.loc[d[bad_col] == 1, bal_col].sum()
+            }))
+            .reset_index()
+        )
+        agg['Pct_Bad_Bal'] = agg['Bad_Bal'] / agg['Total_Bal'] * 100
+        agg = agg.sort_values('decile')
+        
+        return agg
+
+def plot_prediction_results(test_result, 
+                            bal_col='Dec2023Bal', 
+                            bad_col='y_true',
+                            score_col='y_pred', 
+                            n_deciles=10,
+                            title = 'Balance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality (Test Set)'):
+
+    test_result['Score_model'] = -test_result[score_col]
+
+    cols_needed = ['Score_model', 'Borrower Credit Quality', bal_col, bad_col]
+    df_all = test_result[cols_needed].dropna()
+
+    df_all['Dec2023Bal'] = pd.to_numeric(df_all['Dec2023Bal'], errors='coerce').fillna(0)
+    df_all.loc[df_all['Dec2023Bal'] < 0, 'Dec2023Bal'] = 0
+
+    agg_model = make_balance_deciles(df_all, 'Score_model', bal_col, bad_col, n_deciles=n_deciles)
+    agg_bcq   = make_balance_deciles(df_all, 'Borrower Credit Quality', bal_col, bad_col, n_deciles=n_deciles)
+
+    # print("Model deciles (balance-weighted):")
+    # agg_model.to_clipboard(index=False)
+
+    # print("\nBorrower Credit Quality deciles (balance-weighted):")
+    # # agg_bcq.to_clipboard()
+
+    plt.figure(figsize=(8, 5))
+
+    plt.plot(
+        agg_model['decile'].to_numpy(),
+        agg_model['Pct_Bad_Bal'].to_numpy(),
+        marker='o',
+        label='Model Score'
+    )
+
+    plt.plot(
+        agg_bcq['decile'].to_numpy(),
+        agg_bcq['Pct_Bad_Bal'].to_numpy(),
+        marker='o',
+        linestyle='--',
+        label='Borrower Credit Quality'
+    )
+
+    plt.xlabel('Decile (1 = worst risk, 10 = best risk)')
+    plt.ylabel(f'% of {bal_col} that is EverD60CO')
+    plt.title(title)
+    plt.grid(True)
+    plt.xticks(range(1, n_deciles + 1))
+    plt.legend()
+    plt.show()
+
+    return agg_model, agg_bcq
+
+
+def plot_all_prediction_results(df, test_result, train_result, score_col='y_pred', bal_col='Dec2023Bal', n_deciles=10):
+    if 'Borrower Credit Quality' not in test_result.columns:
+        test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', 'Borrower Credit Quality']], on='New_Underlying_Exposure_Identifier', how='left')
+    if 'Borrower Credit Quality' not in train_result.columns:
+        train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', 'Borrower Credit Quality']], on='New_Underlying_Exposure_Identifier', how='left')
+
+
+    if bal_col not in test_result.columns:
+        test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', bal_col]], on='New_Underlying_Exposure_Identifier', how='left')
+    if bal_col not in train_result.columns:
+        train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', bal_col]], on='New_Underlying_Exposure_Identifier', how='left')
+
+    test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', 'EverD60CO_Sep2025', 'EverD60CO_Mar2026']], on='New_Underlying_Exposure_Identifier', how='left')
+    train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', 'EverD60CO_Sep2025', 'EverD60CO_Mar2026']], on='New_Underlying_Exposure_Identifier', how='left')
+
+    test_result['new_default_flag'] = np.where(test_result['EverD60CO_Sep2025'] == 1, 0, test_result['EverD60CO_Mar2026'])
+    train_result['new_default_flag'] = np.where(train_result['EverD60CO_Sep2025'] == 1, 0, train_result['EverD60CO_Mar2026'])
+
+
+    agg_model_train, agg_bcq_train = plot_prediction_results(train_result, bal_col=bal_col, bad_col='EverD60CO_Sep2025', score_col=score_col, n_deciles=n_deciles, 
+        title = 'Train Set (Loan Count {:,.0f}) cut off 9/30/2025\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(train_result)))
+
+    agg_model_train, agg_bcq_train = plot_prediction_results(train_result, bal_col=bal_col, bad_col='EverD60CO_Mar2026', score_col=score_col, n_deciles=n_deciles, 
+            title = 'Train Set (Loan Count {:,.0f}) cut off 3/31/2026\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(train_result)))
+
+    agg_model_train, agg_bcq_train = plot_prediction_results(train_result, bal_col=bal_col, bad_col='new_default_flag', score_col=score_col, n_deciles=n_deciles, 
+            title = 'Train Set (Loan Count {:,.0f}) New DQ60/CO between 9/30/2025 and 3/31/2026\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(train_result)))
+
+    agg_model_test, agg_bcq_test = plot_prediction_results(test_result, bal_col=bal_col, bad_col='EverD60CO_Mar2026', score_col=score_col, n_deciles=n_deciles, 
+            title = 'Test Set (Loan Count {:,.0f}) cut off 3/31/2026\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(test_result)))
+
+    agg_model_test, agg_bcq_test = plot_prediction_results(test_result, bal_col=bal_col, bad_col='new_default_flag', score_col=score_col, n_deciles=n_deciles, 
+            title = 'Test Set (Loan Count {:,.0f}) New DQ60/CO between 9/30/2025 and 3/31/2026\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(test_result)))
+
+    agg_model_test, agg_bcq_test = plot_prediction_results(test_result, bal_col=bal_col, bad_col='EverD60CO_Sep2025', score_col=score_col, n_deciles=n_deciles, 
+            title = 'Test Set (Loan Count {:,.0f}) cut off 9/30/2025\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(test_result)))

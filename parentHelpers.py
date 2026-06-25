@@ -20,6 +20,7 @@ from loanPipelineHelpers import read_tabular, trim_last_n
 from IPython.display import display
 
 from scipy.stats import gaussian_kde
+import seaborn as sns 
 
 # ---------- Formatters ----------
 
@@ -1847,3 +1848,16 @@ def fill_from_latest_nonblank_snapshot(
         display(audit_table)
 
     return out, audit_table
+
+
+def plot_correlation_simple(df, cols_for_corr, plot = True):
+    cols_for_corr = [col for col in cols_for_corr if df[col].dtype != 'object' ]  
+
+    corr = df[cols_for_corr].corr(method='pearson')
+    if plot:
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", vmin=-1, vmax=1, square=True, cbar_kws={"shrink": .8})
+        plt.title("Correlation Matrix")
+        plt.show()
+
+    return corr

@@ -29,6 +29,7 @@ from sklearn.metrics import (
 )
 
 # Stats
+from parentHelpers import get_wt_distribution, groupby_weighted_avg, plot_correlation_simple
 from scipy import stats
 
 # Plotting
@@ -220,7 +221,7 @@ def clean_feature_names(feature_names):
 
     return cleaned
 
-def sort_spline_by_var(df):
+def sort_spline_by_var_legacy(df):
     df = df.copy()
 
     def get_var(f):
@@ -239,6 +240,68 @@ def sort_spline_by_var(df):
     df["_orig_order"] = df["Feature"].apply(get_order)
 
     df = df.sort_values(["_var", "_orig_order"]).drop(columns=["_var", "_orig_order"])
+
+    return df
+
+def sort_spline_by_var(df, spline_features=None):
+    df = df.copy()
+    summary_features = {"Intercept", "R²", "Accuracy", "AUC"}
+
+    if isinstance(spline_features, dict):
+        spline_vars = list(spline_features.keys())
+    elif spline_features:
+        spline_vars = list(spline_features)
+    else:
+        spline_vars = []
+
+    spline_order = {var: i for i, var in enumerate(spline_vars)}
+    spline_vars_by_length = sorted(spline_vars, key=len, reverse=True)
+
+    def get_spline_var(feature):
+        if not isinstance(feature, str):
+            return None
+
+        for var in spline_vars_by_length:
+            if feature.startswith(f"{var}_"):
+                return var
+
+        return None
+
+    def get_spline_order(feature):
+        try:
+            return int(str(feature).rsplit("_", 1)[-1])
+        except ValueError:
+            return 0
+
+    df["_orig_order"] = range(len(df))
+    df["_spline_var"] = df["Feature"].apply(get_spline_var)
+    df["_is_summary"] = df["Feature"].isin(summary_features)
+
+    df["_section"] = 0
+    df.loc[df["_spline_var"].notna(), "_section"] = 1
+    df.loc[df["_is_summary"], "_section"] = 2
+
+    df["_var_order"] = df.apply(
+        lambda row: spline_order.get(row["_spline_var"], row["_orig_order"]),
+        axis=1
+    )
+    df["_feature_order"] = df.apply(
+        lambda row: get_spline_order(row["Feature"]) if row["_spline_var"] else row["_orig_order"],
+        axis=1
+    )
+
+    df = df.sort_values(
+        ["_section", "_var_order", "_feature_order", "_orig_order"]
+    ).drop(
+        columns=[
+            "_orig_order",
+            "_spline_var",
+            "_is_summary",
+            "_section",
+            "_var_order",
+            "_feature_order"
+        ]
+    )
 
     return df
 
@@ -276,7 +339,7 @@ def find_middle_spline_baseline(X, var, breaks):
     mid_idx = len(breaks) // 2
     mid_value = breaks[mid_idx]
 
-    return f"{var}_{mid_value}_{(mid_idx+1):.0f}"
+    return f"{var}_{_format_break(mid_value)}_{(mid_idx+1):.0f}"
 
 # =========================
 # FEATURE IMPORTANCE PLOT
@@ -305,6 +368,24 @@ def plot_feature_importance(coef_df, top_n=15):
     plt.xlabel("Coefficient")
     plt.tight_layout()
     plt.show()
+
+
+def create_spline_features_inputs(df, 
+                                  piecewise_features,
+                                  percentiles=[10,30,50,70,90]):
+    # Create a dictionary to store percentiles for each variable
+    percentile_dict = {}
+
+    for column in piecewise_features:
+        percentiles_for_variable = []
+        for percentile in percentiles:
+            value = np.percentile(df[column], percentile)
+            #round value to 2 decimal places
+            value = round(value, 2)
+            percentiles_for_variable.append(value)
+        percentile_dict[column] = percentiles_for_variable
+
+    return percentile_dict
 
 
 # =========================
@@ -367,7 +448,7 @@ def train_model(
     encoder = OneHotEncoder(
         categories=cat_categories,
         drop=cat_drop,
-        sparse=False
+        sparse_output=False
     )
 
     transformers.append(("cat", encoder, categorical_features))
@@ -406,8 +487,9 @@ def train_model(
         model = LogisticRegression(
             # penalty="l2",
             # class_weight="balanced",
-            penalty="none",
-            solver='lbfgs',
+            penalty="l2",
+            C=1.0,
+            solver='liblinear',
             max_iter=1000
         )
 
@@ -644,7 +726,7 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
             plt.tight_layout()
             plt.show()
 
-    coef_df = sort_spline_by_var(coef_df)
+    coef_df = sort_spline_by_var(coef_df, spline_features)
     # =========================
     # FEATURE IMPORTANCE
     # =========================
@@ -688,22 +770,6 @@ def apply_category_mapping(df, categorical_features, category_maps):
     return df
 
 
-def plot_corr(X, plot):
-        # Plot correlation matrix for numeric features
-    corr = X.corr()
-
-    if plot:
-        plt.figure()
-        plt.imshow(corr)
-        plt.colorbar()
-        plt.xticks(range(len(corr.columns)), corr.columns, rotation=90)
-        plt.yticks(range(len(corr.columns)), corr.columns)
-        plt.title("Feature Correlation Matrix")
-        plt.tight_layout()
-        plt.show()
-
-    return corr
-
 # -------------------------------------------------
 # MAIN MODEL PIPELINE   
 # -------------------------------------------------
@@ -716,6 +782,7 @@ def run_model_pipeline(df,
                        model_type="linear",
                        test_size=0,
                        df_test = None,
+                       test_target_col=None,
                        max_categories=10,
                        random_state=42,
                        plot=True,
@@ -731,36 +798,41 @@ def run_model_pipeline(df,
     # =========================
     # PREP DATA
     # =========================
+    eval_target_col = test_target_col if test_target_col is not None else target_col
     id_series = df[id_col] if id_col else None
     X = df[categorical_features + numeric_features + (list(spline_features.keys()) if spline_features else [])].copy()
     X = clean_numeric_data(X, numeric_features) 
 
     y = df[target_col]
+    y_eval = df[eval_target_col] if test_size and test_size > 0 else y
     # Drop rows where y is NaN
     mask = y.notna()
+    if test_size and test_size > 0:
+        mask = mask & y_eval.notna()
     X = X[mask]
     y = y[mask]
+    y_eval = y_eval[mask]
     if id_col:
         id_series = id_series[mask]
 
 
     # Plot correlation matrix for numeric features
-    corr = plot_corr(X, plot)
+    corr = plot_correlation_simple(X, X.columns, plot=plot)
 
     if only_plot_corr == True:
-        return
+        return corr
 
     # =========================
     # TRAIN / TEST SPLIT
     # =========================
     if test_size and test_size > 0:
         if id_col:
-            X_train, X_test, y_train, y_test, id_train, id_test = train_test_split(
-                X, y, id_series, test_size=test_size, random_state=random_state
+            X_train, X_test, y_train, _, _, y_test, id_train, id_test = train_test_split(
+                X, y, y_eval, id_series, test_size=test_size, random_state=random_state
             )
         else:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=test_size, random_state=random_state
+            X_train, X_test, y_train, _, _, y_test = train_test_split(
+                X, y, y_eval, test_size=test_size, random_state=random_state
             )
             id_train, id_test = None, None
         do_oos = True
@@ -772,7 +844,7 @@ def run_model_pipeline(df,
             id_test = df_test[id_col] if id_col else None
             X_test = df_test[categorical_features + numeric_features + (list(spline_features.keys()) if spline_features else [])].copy()
             X_test = clean_numeric_data(X_test, numeric_features) 
-            y_test = df_test[target_col]
+            y_test = df_test[eval_target_col]
 
             do_oos = True
         else:
@@ -910,3 +982,371 @@ def run_model_pipeline(df,
         "X_test_with_preds": X_test_with_preds if do_oos else None,
         "has_oos": do_oos
     }
+
+
+def run_residual_layer_pipeline(
+    df,
+    target_col,
+    base_categorical_features,
+    base_numeric_features,
+    residual_categorical_features,
+    residual_numeric_features,
+    base_spline_features=None,
+    residual_spline_features=None,
+    base_manual_baseline=None,
+    residual_manual_baseline=None,
+    base_model_type="logistic",
+    residual_model_type="linear",
+    test_size=0,
+    df_test=None,
+    test_target_col=None,
+    max_categories=10,
+    residual_max_categories=None,
+    random_state=42,
+    plot=True,
+    output_coef=False,
+    base_output_file_name="Stage1_Regression_Coefficients.xlsx",
+    residual_output_file_name="Stage2_Residual_Regression_Coefficients.xlsx",
+    plot_top_n_features=25,
+    id_col=None,
+    adjust_logistic_decision_threshold=None,
+    intercept_multiplier=1.0,
+    residual_col="stage1_residual",
+    stage1_pred_col="stage1_pred",
+    stage2_pred_col="stage2_residual_pred",
+    combined_pred_col="combined_pred",
+    clip_combined_pred=True
+):
+    """
+    Run a two-layer model:
+    1. Fit the base model on fundamental factors.
+    2. Fit a second model on the base-model residual.
+    """
+    residual_max_categories = (
+        residual_max_categories
+        if residual_max_categories is not None
+        else max_categories
+    )
+
+    stage1_results = run_model_pipeline(
+        df=df,
+        target_col=target_col,
+        categorical_features=base_categorical_features,
+        numeric_features=base_numeric_features,
+        spline_features=base_spline_features,
+        manual_baseline=base_manual_baseline,
+        model_type=base_model_type,
+        test_size=test_size,
+        df_test=df_test,
+        test_target_col=test_target_col,
+        max_categories=max_categories,
+        random_state=random_state,
+        plot=plot,
+        output_coef=output_coef,
+        output_file_name=base_output_file_name,
+        plot_top_n_features=plot_top_n_features,
+        id_col=id_col,
+        adjust_logistic_decision_threshold=adjust_logistic_decision_threshold,
+        intercept_multiplier=intercept_multiplier
+    )
+
+    def build_residual_df(source_df, preds_df):
+        out = source_df.loc[preds_df.index].copy()
+        out[stage1_pred_col] = preds_df["y_pred"].to_numpy()
+        out[residual_col] = (
+            preds_df["y_true"].to_numpy()
+            - preds_df["y_pred"].to_numpy()
+        )
+        return out
+
+    stage2_train_df = build_residual_df(
+        df,
+        stage1_results["X_train_with_preds"]
+    )
+
+    stage2_test_df = None
+    if stage1_results["has_oos"]:
+        test_source_df = df if test_size and test_size > 0 else df_test
+        stage2_test_df = build_residual_df(
+            test_source_df,
+            stage1_results["X_test_with_preds"]
+        )
+
+    stage2_results = run_model_pipeline(
+        df=stage2_train_df,
+        target_col=residual_col,
+        categorical_features=residual_categorical_features,
+        numeric_features=residual_numeric_features,
+        spline_features=residual_spline_features,
+        manual_baseline=residual_manual_baseline,
+        model_type=residual_model_type,
+        test_size=0,
+        df_test=stage2_test_df,
+        max_categories=residual_max_categories,
+        random_state=random_state,
+        plot=plot,
+        output_coef=output_coef,
+        output_file_name=residual_output_file_name,
+        plot_top_n_features=plot_top_n_features,
+        id_col=id_col
+    )
+
+    def build_combined_preds(stage1_preds_df, stage2_preds_df):
+        combined = stage2_preds_df.copy().rename(
+            columns={
+                "y_true": residual_col,
+                "y_pred": stage2_pred_col
+            }
+        )
+        combined["y_true"] = stage1_preds_df["y_true"].to_numpy()
+        combined[stage1_pred_col] = stage1_preds_df["y_pred"].to_numpy()
+        combined[combined_pred_col] = (
+            combined[stage1_pred_col] + combined[stage2_pred_col]
+        )
+
+        if clip_combined_pred and base_model_type == "logistic":
+            combined[combined_pred_col] = combined[combined_pred_col].clip(0, 1)
+
+        combined["y_pred"] = combined[combined_pred_col]
+        return combined
+
+    combined_train_with_preds = build_combined_preds(
+        stage1_results["X_train_with_preds"],
+        stage2_results["X_train_with_preds"]
+    )
+
+    combined_test_with_preds = None
+    if stage1_results["has_oos"]:
+        combined_test_with_preds = build_combined_preds(
+            stage1_results["X_test_with_preds"],
+            stage2_results["X_test_with_preds"]
+        )
+
+    def score_combined(preds_df, prefix):
+        if preds_df is None:
+            return {}
+
+        y_true = preds_df["y_true"]
+        y_pred = preds_df[combined_pred_col]
+
+        if base_model_type == "linear":
+            return {
+                f"RMSE_{prefix}": np.sqrt(mean_squared_error(y_true, y_pred)),
+                f"R2_{prefix}": r2_score(y_true, y_pred)
+            }
+
+        threshold = (
+            adjust_logistic_decision_threshold
+            if adjust_logistic_decision_threshold is not None
+            else 0.5
+        )
+        metrics = {
+            f"Accuracy_{prefix}": accuracy_score(
+                y_true,
+                (y_pred > threshold).astype(int)
+            )
+        }
+
+        try:
+            metrics[f"AUC_{prefix}"] = roc_auc_score(y_true, y_pred)
+        except ValueError:
+            metrics[f"AUC_{prefix}"] = np.nan
+
+        return metrics
+
+    combined_results = {}
+    combined_results.update(score_combined(combined_train_with_preds, "train"))
+    combined_results.update(score_combined(combined_test_with_preds, "test"))
+
+    return {
+        "stage1_results": stage1_results,
+        "stage2_results": stage2_results,
+        "combined_train_with_preds": combined_train_with_preds,
+        "combined_test_with_preds": combined_test_with_preds,
+        "combined_results": combined_results,
+        "residual_col": residual_col,
+        "stage1_pred_col": stage1_pred_col,
+        "stage2_pred_col": stage2_pred_col,
+        "combined_pred_col": combined_pred_col
+    }
+
+
+def auc_drop_test(df_training, 
+                  target_col, 
+                  categorical_features, 
+                  numeric_features, 
+                  spline_features, 
+                  manual_baseline,
+                  model_type="logistic",
+                  test_size=0,
+                  max_categories=10,
+                  random_state=42):
+    
+    features = categorical_features + numeric_features + list(spline_features.keys())
+    output_list = []
+    for i in range(len(features)+1):
+        if i == 0:
+            results = run_model_pipeline(
+                        df = df_training,
+                        target_col=target_col,
+                        categorical_features=categorical_features,
+                        numeric_features=numeric_features,
+                        spline_features=spline_features, 
+                        manual_baseline = manual_baseline,
+                        model_type=model_type,
+                        
+                        test_size=test_size,
+                        max_categories=max_categories,
+                        plot_top_n_features = None,
+                        random_state=random_state,
+                        
+                        plot=False,
+                        output_coef=False,
+                        # output_file_name="Outputs/Regression_Coefficients.xlsx"
+                    )
+            
+            base_auc = results['coef_df'].loc[len(results['coef_df']) - 1, 'Coefficient']
+            output_list.append(base_auc)
+
+        else:
+            drop_col = features[i-1]
+
+            if drop_col not in df_training.columns:
+                print(f"Warning: {drop_col} not found in training data columns.")
+            else:
+                df_training_ = df_training.drop(columns=drop_col).copy()
+
+            if drop_col in spline_features.keys():
+                spline_features_copy = spline_features.copy()
+                spline_features_copy.pop(drop_col)
+            else:
+                spline_features_copy = spline_features.copy()
+
+            
+            if drop_col in categorical_features:
+                categorical_features_input = categorical_features.copy()
+                categorical_features_input.remove(drop_col)
+            else:
+                categorical_features_input = categorical_features.copy()
+            
+            results = run_model_pipeline(
+                df = df_training_,
+                target_col=target_col,
+                categorical_features=categorical_features_input,
+                numeric_features=numeric_features,
+                spline_features=spline_features_copy,
+                manual_baseline = manual_baseline,
+                model_type=model_type,
+                
+                test_size=test_size,
+                max_categories=max_categories,
+                plot_top_n_features = None,
+                random_state=random_state,
+                plot=False,
+                output_coef=False,
+                # output_file_name="Outputs/Regression_Coefficients.xlsx"
+            )
+                
+            auc = results['coef_df'].loc[len(results['coef_df']) - 1, 'Coefficient']
+            output_list.append(auc)
+
+    res_df = pd.DataFrame([['All'] + features, output_list]).T
+    res_df.columns = ['Variables', 'AUC w/o Variable']
+    res_df['Base AUC'] = base_auc
+    res_df['AUC Drop'] = res_df['AUC w/o Variable'] - base_auc
+    res_df = res_df[res_df['Variables'] != 'All']
+    res_df.sort_values('AUC Drop', ascending=True, inplace=True)
+    res_df['Ranking'] = res_df['AUC Drop'].rank(method='min', ascending=True).astype(int)
+    res_df.reset_index(drop=True, inplace=True)
+
+    return res_df
+
+
+def get_table_for_plot_in_sample_vs_oos(results, 
+                                        df_training, 
+                                        df_test, 
+                                        df_origination, 
+                                        secondary_y_cols, 
+                                        orig_bal_col_name,
+                                        id_col_name,
+                                        vintage_col_name,
+                                        categorical_col_to_plot = None,
+                                        empirical_col = None
+                                        ):
+                    
+    if empirical_col != None:
+        in_sample_outputs = df_training[[id_col_name, empirical_col]]
+        in_sample_outputs.rename(columns = {empirical_col: 'y_true'},  inplace=True)
+    else:
+        in_sample_outputs = results['X_train_with_preds']
+
+    oos_result = results['X_test_with_preds']
+    # oos_result = oos_result[oos_result['Credit Rating Bucket'] == 'B']
+
+    if orig_bal_col_name not in in_sample_outputs.columns:
+        in_sample_outputs = in_sample_outputs.merge(df_training[[id_col_name, vintage_col_name, orig_bal_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
+    else:
+        in_sample_outputs = in_sample_outputs.merge(df_training[[id_col_name, vintage_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
+    in_sample_outputs['Empirical Amount'] = in_sample_outputs.loc[:, 'y_true'] * in_sample_outputs.loc[:, orig_bal_col_name]
+    # print(in_sample_outputs.head())
+
+    if orig_bal_col_name not in oos_result.columns:
+        oos_result = oos_result.merge(df_test[[id_col_name, vintage_col_name, orig_bal_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
+    else:
+        oos_result = oos_result.merge(df_test[[id_col_name, vintage_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
+    oos_result['Model Results Amount'] = oos_result.loc[:, 'y_pred'] * oos_result.loc[:, orig_bal_col_name]
+    print(oos_result.columns)
+    output_oos = oos_result.groupby([vintage_col_name]).sum()[[orig_bal_col_name, 'Model Results Amount']]
+    output_oos['Model Results'] = output_oos['Model Results Amount'] / output_oos[orig_bal_col_name]
+
+    output = in_sample_outputs.groupby([vintage_col_name]).sum()[[orig_bal_col_name, 'Empirical Amount']]
+    output['Empirical'] = output['Empirical Amount'] / output[orig_bal_col_name]
+    # output = output.apply(trim_last_n, n=trim_n )
+
+    output = output.join(output_oos, how='outer', lsuffix='_in_sample', rsuffix='_oos')
+
+    if categorical_col_to_plot:
+        percentage_tables = get_wt_distribution(df_origination, 
+                                                    secondary_y_cols[0],
+                                                    vintage = vintage_col_name,
+                                                    weight_by = orig_bal_col_name, show_total_origination = False, format_pct = False).T
+        output = output.join(percentage_tables[[categorical_col_to_plot]], how='outer')        
+        output_plot = output[['Empirical', 'Model Results'] + [categorical_col_to_plot]]  
+        # secondary_ylabel = '{} = {} %'.format(secondary_y_cols[0], 'Yes' if categorical_col_to_plot == 1 else categorical_col_to_plot)
+        secondary_y_cols = [categorical_col_to_plot]   
+        # secondary_percentage = True                               
+    else:
+        wa_tables = groupby_weighted_avg(df_origination, groupby_col = vintage_col_name, cols = secondary_y_cols, weight_col = orig_bal_col_name)
+        output = output.join(wa_tables, how='outer')    
+
+        output_plot = output[['Empirical', 'Model Results'] + secondary_y_cols]
+        # secondary_percentage = False
+
+    # if secondary_y_cols:
+    #     plot_finance_style(
+    #                         # everdp_plot,
+    #                         output_plot, 
+    #                         title="Ever D{:.0f} at MOB {:.0f} vs {}".format(ever_n_days_past_due, loan_age_cutoff, secondary_ylabel ),
+    #                         ylabel="Ever D{:.0f} at MOB {:.0f}".format(ever_n_days_past_due, loan_age_cutoff), data_labels=False,
+    #                         secondary_y_cols=secondary_y_cols,   # columns on right axis
+    #                         secondary_ylabel = secondary_ylabel,
+    #                         percentage=True,
+    #                         secondary_percentage=secondary_percentage,
+    #                         use_custom_colors=False,
+    #                         linestyles_inputs = ['-', '-', '--']
+    #                         )
+    # else:
+    #     plot_finance_style(
+    #                         # everdp_plot,
+    #                         output_plot, 
+    #                         title="Ever D{:.0f} at MOB {:.0f}".format(ever_n_days_past_due, loan_age_cutoff),
+    #                         ylabel="Ever D{:.0f} at MOB {:.0f}".format(ever_n_days_past_due, loan_age_cutoff), data_labels=False,
+    #                         # secondary_y_cols=secondary_y_cols,   # columns on right axis
+    #                         # secondary_ylabel = secondary_ylabel,
+    #                         percentage=True,
+    #                         secondary_percentage=secondary_percentage,
+    #                         use_custom_colors=False,
+    #                         linestyles_inputs = ['-', '-', '--']
+    #                         )
+
+    return output_plot

@@ -1,0 +1,76 @@
+WITH BeginningAsCurrent AS (
+    SELECT DISTINCT
+        New_Underlying_Exposure_Identifier
+    FROM [ConsumerLoans].[dbo].[PERFF1_Dynamic_Mar2026] AS p
+    WHERE p.Data_Cut_Off_Date = '2023-12-31'
+      AND p.Number_Of_Days_In_Arrears <= 10
+),
+
+firstD60Days AS (
+    SELECT
+        New_Underlying_Exposure_Identifier,
+        MIN(Data_Cut_Off_Date) AS FirstD60Date
+    FROM [ConsumerLoans].[dbo].[PERFF1_Dynamic_Mar2026]
+    WHERE Number_Of_Days_In_Arrears >= 60
+    GROUP BY New_Underlying_Exposure_Identifier
+),
+
+tape_prep AS (
+    SELECT
+        p.*,
+        CASE
+            WHEN f.FirstD60Date IS NOT NULL
+                 AND p.Data_Cut_Off_Date >= f.FirstD60Date
+            THEN 1
+            ELSE 0
+        END AS EverD60
+    FROM [ConsumerLoans].[dbo].[PERFF1_Dynamic_Mar2026] AS p
+    JOIN BeginningAsCurrent AS b
+        ON p.New_Underlying_Exposure_Identifier = b.New_Underlying_Exposure_Identifier
+    LEFT JOIN firstD60Days AS f
+        ON p.New_Underlying_Exposure_Identifier = f.New_Underlying_Exposure_Identifier
+),
+
+ModelTapePart1 as (
+SELECT case when HasDefaulted + EverD60 > 0 then 1 else 0 end as EverD60CO_Sep2025,*
+FROM tape_prep
+WHERE Data_Cut_Off_Date = '2025-09-30' and Origination_Date <= '2023-07-31'
+
+),
+
+ModelTapePart2 as (
+SELECT
+    New_Underlying_Exposure_Identifier,
+    case when HasDefaulted + EverD60 > 0 then 1 else 0 end as EverD60CO_Mar2026
+FROM tape_prep
+WHERE Data_Cut_Off_Date = '2026-03-31' and Origination_Date <= '2023-07-31'
+
+),
+
+Dec2023Balance as (
+    select New_Underlying_Exposure_Identifier,Current_Principal_Balance as Dec2023Bal
+    from [ConsumerLoans].[dbo].[PERFF1_Dynamic_Mar2026]
+    where Data_Cut_Off_Date = '2023-12-31'
+)
+
+SELECT
+    c.EverD60CO_Mar2026,
+    a.*,
+    b.*,
+    DATEDIFF(MONTH, Origination_Date, Pool_Cut_Off_Date) - 21 As LoanAgeDec2023,
+    Dec2023Balance.Dec2023Bal
+FROM ModelTapePart1 AS a
+JOIN ConsumerLoans.dbo.PERFF1_Static_Sep2025 AS b
+    ON  a.Original_Term               = b.[Original Loan Term]
+    AND a.Origination_Date            = b.[Origination Date]
+    AND a.Original_Principal_Balance  = b.[Original Principal Balance]
+    AND ROUND(a.Current_Interest_Rate, 2)
+        = ROUND(b.[Current Interest Rate Distribution] * 100.0, 2)
+    AND a.Primary_Income              = b.[Primary Income]
+    AND a.Purpose                     = b.[Loan_Purpose_Mapped]
+    AND a.Employment_Status           = b.[Employment_Status_Mapped]
+JOIN ModelTapePart2 AS c
+    ON a.New_Underlying_Exposure_Identifier = c.New_Underlying_Exposure_Identifier
+JOIN Dec2023Balance
+    ON a.New_Underlying_Exposure_Identifier = Dec2023Balance.New_Underlying_Exposure_Identifier
+;
