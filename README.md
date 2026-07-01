@@ -4,15 +4,22 @@ Python notebooks and supporting workbooks for deal analytics.
 
 ## Current Workstreams
 
-- `Affirm/` - recent 2026-X1 analysis notebook and pricing outputs.
-- `Project Driver Recreation Vehicles/` - current Recreation Vehicles workflow, baseline curves, CPR/CDR/DQ outputs, and final cash flow output.
+- `Affirm/` - recent analysis notebook and pricing outputs.
+- `PNC Student Loans/` - private student loan processing and analysis notebook.
+- `Project Alamo/` - cascade and CUSIP workflows with Alamo-specific helpers and SQL.
+- `Project Driver Recreation Vehicles/` - recreation vehicles workflow, baseline curves, CPR/CDR/DQ outputs, and final cash flow output.
+- `Project Sunrise/` - database connectivity and reconciliation SQL notebook.
+- `Project Swift Lloyds/` - model development notebooks, SQL, and Swift-specific helper logic.
+- `Revl/` - Revl processing notebook and outputs.
 
 ## Shared Code
 
 - `loanPipelineHelpers.py` - quiet reusable pipeline helpers for reading tabular files, standardizing columns, quality checks, loan/performance merges, panel shaping, target creation, and performance rollups.
 - `parentHelpers.py` - notebook-facing helpers for display, formatting, plotting, Data Wrangler convenience loading, and shared exploratory deal-review tables.
 - `regression.py` - current shared regression pipeline used by the recent notebooks.
-- `helperProjectDriver.py` - Project Driver / Recreation Vehicles-specific curve, payment, prepayment, and cleanup helpers.
+- `Project Driver Recreation Vehicles/helperProjectDriver.py` - Project Driver / Recreation Vehicles-specific curve, payment, prepayment, and cleanup helpers.
+- `Project Alamo/helperProjectAlamo.py` - Alamo-specific helper functions.
+- `Project Swift Lloyds/helperProjectSwift.py` - Swift/Lloyds-specific helper functions.
 
 Rule of thumb for adding new helpers:
 
@@ -20,15 +27,6 @@ Rule of thumb for adding new helpers:
 - Put notebook display, plotting, and presentation formatting in `parentHelpers.py`.
 - Put model training or coefficient/diagnostic logic in `regression.py`.
 - Put one-deal-only assumptions or cleanup in that deal's helper file.
-
-## Legacy Candidates
-
-These files are not imported by the recent Affirm or Project Driver notebooks, but are still left in place until their old deal dependencies are reviewed:
-
-- `linearRegression.py`
-- `regression_old.py`
-- `logisticRegression.py`
-- `Navitas/linear_regression.py`
 
 ## Notes
 
