@@ -341,6 +341,38 @@ def find_middle_spline_baseline(X, var, breaks):
 
     return f"{var}_{_format_break(mid_value)}_{(mid_idx+1):.0f}"
 
+
+def find_manual_spline_baseline(var, breaks, manual_value):
+    """
+    Resolve a user-provided spline baseline to the generated spline column name.
+    manual_value can be either the breakpoint value or the exact spline feature name.
+    """
+    available_features = [
+        f"{var}_{_format_break(value)}_{idx:.0f}"
+        for idx, value in enumerate(breaks, start=1)
+    ]
+
+    if manual_value in available_features:
+        return manual_value
+
+    try:
+        manual_numeric = float(manual_value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Spline baseline '{manual_value}' for {var} is not valid. "
+            f"Use one of these breakpoints: {breaks}, or one of these feature names: "
+            f"{available_features}"
+        )
+
+    for idx, value in enumerate(breaks, start=1):
+        if np.isclose(manual_numeric, float(value)):
+            return f"{var}_{_format_break(value)}_{idx:.0f}"
+
+    raise ValueError(
+        f"Spline baseline '{manual_value}' for {var} is not one of the spline "
+        f"breakpoints. Available breakpoints: {breaks}"
+    )
+
 # =========================
 # FEATURE IMPORTANCE PLOT
 # =========================
@@ -398,6 +430,7 @@ def train_model(
                 numeric_features,
                 spline_features=None,
                 manual_baseline=None,
+                spline_manual_baseline=None,
                 model_type="linear"
                 ):
     
@@ -411,6 +444,7 @@ def train_model(
     # =========================
 
     manual_baseline = manual_baseline or {}
+    spline_manual_baseline = spline_manual_baseline or {}
 
     cat_categories = []
     cat_drop = []
@@ -466,7 +500,14 @@ def train_model(
 
         for var, breaks in spline_features.items():
             # best = find_middle_risk_spline_baseline(X_train, y_train, var, breaks)
-            best = find_middle_spline_baseline(X_train, var, breaks)
+            if var in spline_manual_baseline:
+                best = find_manual_spline_baseline(
+                    var,
+                    breaks,
+                    spline_manual_baseline[var]
+                )
+            else:
+                best = find_middle_spline_baseline(X_train, var, breaks)
 
             # print(f"[SPLINE] {var} baseline → {best}")
 
@@ -727,6 +768,13 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
             plt.show()
 
     coef_df = sort_spline_by_var(coef_df, spline_features)
+    front_cols = [
+        col for col in ["Feature", "Coefficient", "Count", "P Value"]
+        if col in coef_df.columns
+    ]
+    coef_df = coef_df[
+        front_cols + [col for col in coef_df.columns if col not in front_cols]
+    ]
     # =========================
     # FEATURE IMPORTANCE
     # =========================
@@ -779,6 +827,7 @@ def run_model_pipeline(df,
                        numeric_features,
                        spline_features=None,
                        manual_baseline=None,
+                       spline_manual_baseline=None,
                        model_type="linear",
                        test_size=0,
                        df_test = None,
@@ -876,6 +925,7 @@ def run_model_pipeline(df,
                                             numeric_features,
                                             spline_features=spline_features,
                                             manual_baseline=manual_baseline,
+                                            spline_manual_baseline=spline_manual_baseline,
                                             model_type=model_type
                                             )
 
@@ -995,6 +1045,8 @@ def run_residual_layer_pipeline(
     residual_spline_features=None,
     base_manual_baseline=None,
     residual_manual_baseline=None,
+    base_spline_manual_baseline=None,
+    residual_spline_manual_baseline=None,
     base_model_type="logistic",
     residual_model_type="linear",
     test_size=0,
@@ -1035,6 +1087,7 @@ def run_residual_layer_pipeline(
         numeric_features=base_numeric_features,
         spline_features=base_spline_features,
         manual_baseline=base_manual_baseline,
+        spline_manual_baseline=base_spline_manual_baseline,
         model_type=base_model_type,
         test_size=test_size,
         df_test=df_test,
@@ -1079,6 +1132,7 @@ def run_residual_layer_pipeline(
         numeric_features=residual_numeric_features,
         spline_features=residual_spline_features,
         manual_baseline=residual_manual_baseline,
+        spline_manual_baseline=residual_spline_manual_baseline,
         model_type=residual_model_type,
         test_size=0,
         df_test=stage2_test_df,

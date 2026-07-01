@@ -209,6 +209,12 @@ def clean_loan_tape(LoanTape):
                                                                 else 'Debt Consolidation, Travel or Other')
     LoanTape['Region'] = LoanTape['Post Code Region Application_Bucket'].apply(lambda x: x if x in ['London'] 
                                                                                 else 'Outside London')
+    
+    LoanTape['Has 2 Borrowers'] = np.where(LoanTape['Number of Borrowers'] == 2, 1, 0)
+    LoanTape['Has 2 Borrowers x Borrower Credit Quality'] = LoanTape['Has 2 Borrowers'] * LoanTape['Borrower Credit Quality']
+
+    LoanTape['Has 1 Borrowers'] = np.where(LoanTape['Number of Borrowers'] == 1, 1, 0)
+    LoanTape['Has 1 Borrowers x Borrower Credit Quality'] = LoanTape['Has 1 Borrowers'] * LoanTape['Borrower Credit Quality']
         
     return LoanTape
 
@@ -246,104 +252,125 @@ def plot_everD60_by_features(df, everD60_col='EverD60CO_Mar2026'):
         'PTI',
         'MonthlyPayment',
         'Primary_Income',
-        'LoanAgeDec2023'
+        'LoanAgeDec2023',
+        # "Has 2 Borrowers x Borrower Credit Quality"
     ]
 
     for col in cols:
-        # if col not in df.columns or col in ["EverD60CO", "Dec2023Bal"]:
         if col not in df.columns or col in [everD60_col]:
             continue
+        plot_one_visualization(df, col, everD60_col=everD60_col)
+        
 
-        display_col = col.replace("_Bucket", "").replace("_", " ")
-        s = df[col]
-        n_unique = s.nunique(dropna=True)
-        is_categorical = (s.dtype == "object") or (s.dtype.name == "category")
+def plot_one_visualization(df, col, everD60_col='EverD60CO_Mar2026', breakpoints=None, n_bins=10):
+    # if col not in df.columns or col in ["EverD60CO", "Dec2023Bal"]:
 
-        # ---------- CASE 1: categorical or <= 10 unique values ----------
-        if is_categorical or n_unique <= 10:
-            grouped = df.groupby(col, dropna=False, sort=False)
-            pct = grouped.apply(
-                lambda g: g.loc[g[everD60_col] == 1, "Dec2023Bal"].sum() / g["Dec2023Bal"].sum()
-                if g["Dec2023Bal"].sum() != 0 else 0
+    display_col = col.replace("_Bucket", "").replace("_", " ")
+    s = df[col]
+    n_unique = s.nunique(dropna=True)
+    is_categorical = (s.dtype == "object") or (s.dtype.name == "category")
+
+    # ---------- CASE 1: categorical or <= 10 unique values ----------
+    if breakpoints is None and (is_categorical or n_unique <= 10):
+        grouped = df.groupby(col, dropna=False, sort=False)
+        pct = grouped.apply(
+            lambda g: g.loc[g[everD60_col] == 1, "Dec2023Bal"].sum() / g["Dec2023Bal"].sum()
+            if g["Dec2023Bal"].sum() != 0 else 0
+        )
+        counts = grouped.size()
+
+        plt.figure(figsize=(11, 5))
+        ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
+        ymax = pct.max() if len(pct) else 0
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
+        ax.set_ylabel("DQ60/CO% of orig bal\n(defined as Dec-2023 balance) as of 3/31/2026")
+        ax.set_xlabel("")
+        ax.set_title(f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
+
+        # Add sample size above bars
+        for i, value in enumerate(pct):
+            ax.text(
+                i,
+                value + (ymax * 0.03 if ymax > 0 else 0.002),
+                f"{value:.1%}\nn={counts.iloc[i]:,}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
             )
-            counts = grouped.size()
 
-            plt.figure(figsize=(11, 5))
-            ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
-            ymax = pct.max() if len(pct) else 0
-            ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
-            ax.set_ylabel("DQ60/CO% of orig bal\n(defined as Dec-2023 balance) as of 3/31/2026")
-            ax.set_xlabel("")
-            ax.set_title(f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
-            ax.grid(axis="y", linestyle="--", alpha=0.35)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        plt.show()
 
-            # Add sample size above bars
-            for i, value in enumerate(pct):
-                ax.text(
-                    i,
-                    value + (ymax * 0.03 if ymax > 0 else 0.002),
-                    f"{value:.1%}\nn={counts.iloc[i]:,}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
+    # ---------- CASE 2: numeric with > 10 values ----------
+    else:
+        numeric_s = pd.to_numeric(s, errors="coerce")
+        valid = df[numeric_s.notna()].copy()
+        numeric_s = numeric_s[numeric_s.notna()]
 
-            plt.xticks(rotation=45, ha="right")
-            plt.tight_layout()
-            plt.show()
+        if numeric_s.nunique() == 0:
+            return
 
-        # ---------- CASE 2: numeric with > 10 values ----------
+        if breakpoints is not None:
+            data_min = numeric_s.min()
+            data_max = numeric_s.max()
+            breakpoint_values = (
+                pd.Series(breakpoints, dtype="float64")
+                .dropna()
+                .sort_values()
+                .unique()
+            )
+            breakpoint_values = [
+                value for value in breakpoint_values
+                if data_min < value < data_max
+            ]
+            cut_bins = [data_min] + breakpoint_values + [data_max]
+            bins = pd.cut(numeric_s, bins=cut_bins, include_lowest=True)
         else:
-            numeric_s = pd.to_numeric(s, errors="coerce")
-            valid = df[numeric_s.notna()].copy()
-            numeric_s = numeric_s[numeric_s.notna()]
-
-            if numeric_s.nunique() == 0:
-                continue
-
             try:
-                bins = pd.qcut(numeric_s, q=10, duplicates="drop")
+                bins = pd.qcut(numeric_s, q=n_bins, duplicates="drop")
             except ValueError:
-                bins = pd.cut(numeric_s, bins=10)
+                bins = pd.cut(numeric_s, bins=n_bins)
 
-            valid["_bin"] = bins
+        valid["_bin"] = bins
 
-            grouped = valid.groupby("_bin", dropna=False)
-            pct = grouped.apply(
-                lambda g: g.loc[g[everD60_col] == 1, "Dec2023Bal"].sum() / g["Dec2023Bal"].sum()
-                if g["Dec2023Bal"].sum() != 0 else 0
+        grouped = valid.groupby("_bin", dropna=False)
+        pct = grouped.apply(
+            lambda g: g.loc[g[everD60_col] == 1, "Dec2023Bal"].sum() / g["Dec2023Bal"].sum()
+            if g["Dec2023Bal"].sum() != 0 else 0
+        )
+        counts = grouped.size()
+
+        plt.figure(figsize=(11, 5))
+        ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
+        ymax = pct.max() if len(pct) else 0
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
+        ax.set_ylabel("DQ60/CO% of orig bal\n(defined as Dec-2023 balance) as of 3/31/2026")
+        ax.set_xlabel("")
+        ax.set_title(f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
+
+        # Add sample size text
+        for i, value in enumerate(pct):
+            ax.text(
+                i,
+                value + (ymax * 0.03 if ymax > 0 else 0.002),
+                f"{value:.1%}\nn={counts.iloc[i]:,}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
             )
-            counts = grouped.size()
 
-            plt.figure(figsize=(11, 5))
-            ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
-            ymax = pct.max() if len(pct) else 0
-            ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
-            ax.set_ylabel("DQ60/CO% of orig bal\n(defined as Dec-2023 balance) as of 3/31/2026")
-            ax.set_xlabel("")
-            ax.set_title(f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
-            ax.grid(axis="y", linestyle="--", alpha=0.35)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
-
-            # Add sample size text
-            for i, value in enumerate(pct):
-                ax.text(
-                    i,
-                    value + (ymax * 0.03 if ymax > 0 else 0.002),
-                    f"{value:.1%}\nn={counts.iloc[i]:,}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
-
-            plt.xticks(rotation=45, ha="right")
-            plt.tight_layout()
-            plt.show()
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        plt.show()
 
 
 def make_balance_deciles(df, score_col, bal_col, bad_col, n_deciles=10):
@@ -369,31 +396,121 @@ def make_balance_deciles(df, score_col, bal_col, bad_col, n_deciles=10):
         agg['Pct_Bad_Bal'] = agg['Bad_Bal'] / agg['Total_Bal'] * 100
         agg = agg.sort_values('decile')
         
-        return agg
+        return agg, df_sorted
 
-def plot_prediction_results(test_result, 
-                            bal_col='Dec2023Bal', 
-                            bad_col='y_true',
-                            score_col='y_pred', 
-                            n_deciles=10,
-                            title = 'Balance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality (Test Set)'):
 
+def return_combined_results_for_plotting(residual_results, df,
+                                         result_data = 'combined_train_with_preds',
+                                         bad_col='EverD60CO_Sep2025',
+                                         bal_col='Dec2023Bal',
+                                         lloyds_score_col='Borrower Credit Quality',
+                                         n_deciles=10):
+    
+    train_result_stage_1 = residual_results[result_data][['New_Underlying_Exposure_Identifier', residual_results['stage1_pred_col']]]
+    train_result_stage_2 = residual_results[result_data][['New_Underlying_Exposure_Identifier', residual_results['combined_pred_col']]]
+
+    train_result_stage_1 = add_additional_columns_for_plotting_prediction_results(df, train_result_stage_1, bal_col=bal_col)
+    train_result_stage_2 = add_additional_columns_for_plotting_prediction_results(df, train_result_stage_2, bal_col=bal_col)
+
+    agg_model_train_stage_1_sep2025, agg_bcq_train_stage_1_sep2025, df_sorted_model_train_stage_1_sep2025, df_sorted_bcq_train_stage_1_sep2025 = get_decile_boundaries(train_result_stage_1, 
+                            bal_col=bal_col, 
+                            bad_col=bad_col,
+                            score_col=residual_results['stage1_pred_col'],  # this is the BV score model column
+                            lloyds_score_col=lloyds_score_col,  # this is the Lloyds score column
+                            n_deciles=n_deciles)
+
+    agg_model_train_stage_2_sep2025, agg_bcq_train_stage_2_sep2025, df_sorted_model_train_stage_2_sep2025, df_sorted_bcq_train_stage_2_sep2025 = get_decile_boundaries(train_result_stage_2, 
+                        bal_col=bal_col, 
+                        bad_col=bad_col,
+                        score_col=residual_results['combined_pred_col'],  # this is the BV score model column
+                        lloyds_score_col=lloyds_score_col,  # this is the Lloyds score column
+                        n_deciles=n_deciles)
+    
+
+    train_stage_1_score_dq60_pct = agg_model_train_stage_1_sep2025[['decile', 'Pct_Bad_Bal']]
+    train_stage_1_score_dq60_pct.rename(columns={'Pct_Bad_Bal': 'Stage 1 Model'}, inplace=True)
+    train_lloyds_score_dq60_pct = agg_bcq_train_stage_1_sep2025[['Pct_Bad_Bal']]
+    train_lloyds_score_dq60_pct.rename(columns={'Pct_Bad_Bal': 'Lloyds Score: Borrower Credit Quality'}, inplace=True)
+    train_stage_2_score_dq60_pct = agg_model_train_stage_2_sep2025[['Pct_Bad_Bal']]
+    train_stage_2_score_dq60_pct.rename(columns={'Pct_Bad_Bal': 'Stage 2: Stage 1 + Interest Rate Residual Model'}, inplace=True)
+    res_train_plot = train_lloyds_score_dq60_pct.join(train_stage_1_score_dq60_pct).join(train_stage_2_score_dq60_pct)
+
+    return res_train_plot
+
+def plot_stage_1_2_compare(plot_df, title):
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        plot_df['decile'].to_numpy(),
+        plot_df['Stage 1 Model'].to_numpy(),
+        marker='o',
+        label='Stage 1 Model Score'
+    )
+
+    plt.plot(
+        plot_df['decile'].to_numpy(),
+        plot_df['Stage 2: Stage 1 + Interest Rate Residual Model'].to_numpy(),
+        marker='o',
+        linestyle='-',
+        label='Stage 2: Stage 1 + Interest Rate Residual Model'
+    )
+
+    plt.plot(
+        plot_df['decile'].to_numpy(),
+        plot_df['Lloyds Score: Borrower Credit Quality'].to_numpy(),
+        marker='o',
+        linestyle='--',
+        label='Lloyds Score: Borrower Credit Quality'
+    )
+
+    plt.xlabel('Decile (1 = worst risk, 10 = best risk)')
+    plt.ylabel(f'% of Dec2023 Bal that is EverD60CO')
+    plt.title(title)
+    plt.grid(True)
+    plt.xticks(range(1, len(plot_df['decile'].to_numpy()) + 1))
+    plt.legend()
+    plt.show()
+
+def get_decile_boundaries(test_result, 
+                        bal_col='Dec2023Bal', 
+                        bad_col='y_true',
+                        score_col='y_pred',  # this is the BV score model column
+                        lloyds_score_col='Borrower Credit Quality',  # this is the Lloyds score column
+                        n_deciles=10,):
     test_result['Score_model'] = -test_result[score_col]
 
-    cols_needed = ['Score_model', 'Borrower Credit Quality', bal_col, bad_col]
+    cols_needed = ['New_Underlying_Exposure_Identifier', 'Score_model', lloyds_score_col, bal_col, bad_col]
     df_all = test_result[cols_needed].dropna()
 
     df_all['Dec2023Bal'] = pd.to_numeric(df_all['Dec2023Bal'], errors='coerce').fillna(0)
     df_all.loc[df_all['Dec2023Bal'] < 0, 'Dec2023Bal'] = 0
 
-    agg_model = make_balance_deciles(df_all, 'Score_model', bal_col, bad_col, n_deciles=n_deciles)
-    agg_bcq   = make_balance_deciles(df_all, 'Borrower Credit Quality', bal_col, bad_col, n_deciles=n_deciles)
+    agg_model, df_sorted_model = make_balance_deciles(df_all, 'Score_model', bal_col, bad_col, n_deciles=n_deciles)
+    agg_bcq, df_sorted_bcq   = make_balance_deciles(df_all, lloyds_score_col, bal_col, bad_col, n_deciles=n_deciles)
+
+    return agg_model, agg_bcq, df_sorted_model, df_sorted_bcq
+
+
+def plot_prediction_results(test_result, 
+                            bal_col='Dec2023Bal', 
+                            bad_col='y_true',
+                            score_col='y_pred',  # this is the BV score model column
+                            lloyds_score_col='Borrower Credit Quality',  # this is the Lloyds score column
+                            n_deciles=10,
+                            title = 'Balance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality (Test Set)'):
+
+    agg_model, agg_bcq, df_sorted_model, df_sorted_bcq = get_decile_boundaries(test_result, 
+                                                bal_col=bal_col, 
+                                                bad_col=bad_col,
+                                                score_col=score_col,  # this is the BV score model column
+                                                lloyds_score_col=lloyds_score_col,  # this is the Lloyds score column
+                                                n_deciles=n_deciles,)
 
     # print("Model deciles (balance-weighted):")
     # agg_model.to_clipboard(index=False)
 
-    # print("\nBorrower Credit Quality deciles (balance-weighted):")
-    # # agg_bcq.to_clipboard()
+    # print(f"\n{lloyds_score_col} deciles (balance-weighted):")
+    # agg_bcq.to_clipboard()
 
     plt.figure(figsize=(8, 5))
 
@@ -409,7 +526,7 @@ def plot_prediction_results(test_result,
         agg_bcq['Pct_Bad_Bal'].to_numpy(),
         marker='o',
         linestyle='--',
-        label='Borrower Credit Quality'
+        label=lloyds_score_col
     )
 
     plt.xlabel('Decile (1 = worst risk, 10 = best risk)')
@@ -422,25 +539,31 @@ def plot_prediction_results(test_result,
 
     return agg_model, agg_bcq
 
+def add_additional_columns_for_plotting_prediction_results(df, train_result, bal_col='Dec2023Bal'):
+        # if 'Borrower Credit Quality' not in test_result.columns:
+        #     test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', 'Borrower Credit Quality']], on='New_Underlying_Exposure_Identifier', how='left')
+        if 'Borrower Credit Quality' not in train_result.columns:
+            train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', 'Borrower Credit Quality']], on='New_Underlying_Exposure_Identifier', how='left')
+
+
+        # if bal_col not in test_result.columns:
+        #     test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', bal_col]], on='New_Underlying_Exposure_Identifier', how='left')
+        if bal_col not in train_result.columns:
+            train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', bal_col]], on='New_Underlying_Exposure_Identifier', how='left')
+
+        # test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', 'EverD60CO_Sep2025', 'EverD60CO_Mar2026']], on='New_Underlying_Exposure_Identifier', how='left')
+        train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', 'EverD60CO_Sep2025', 'EverD60CO_Mar2026']], on='New_Underlying_Exposure_Identifier', how='left')
+
+        # test_result['new_default_flag'] = np.where(test_result['EverD60CO_Sep2025'] == 1, 0, test_result['EverD60CO_Mar2026'])
+        train_result['new_default_flag'] = np.where(train_result['EverD60CO_Sep2025'] == 1, 0, train_result['EverD60CO_Mar2026'])
+
+        return train_result
+
 
 def plot_all_prediction_results(df, test_result, train_result, score_col='y_pred', bal_col='Dec2023Bal', n_deciles=10):
-    if 'Borrower Credit Quality' not in test_result.columns:
-        test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', 'Borrower Credit Quality']], on='New_Underlying_Exposure_Identifier', how='left')
-    if 'Borrower Credit Quality' not in train_result.columns:
-        train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', 'Borrower Credit Quality']], on='New_Underlying_Exposure_Identifier', how='left')
 
-
-    if bal_col not in test_result.columns:
-        test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', bal_col]], on='New_Underlying_Exposure_Identifier', how='left')
-    if bal_col not in train_result.columns:
-        train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', bal_col]], on='New_Underlying_Exposure_Identifier', how='left')
-
-    test_result = test_result.merge(df[['New_Underlying_Exposure_Identifier', 'EverD60CO_Sep2025', 'EverD60CO_Mar2026']], on='New_Underlying_Exposure_Identifier', how='left')
-    train_result = train_result.merge(df[['New_Underlying_Exposure_Identifier', 'EverD60CO_Sep2025', 'EverD60CO_Mar2026']], on='New_Underlying_Exposure_Identifier', how='left')
-
-    test_result['new_default_flag'] = np.where(test_result['EverD60CO_Sep2025'] == 1, 0, test_result['EverD60CO_Mar2026'])
-    train_result['new_default_flag'] = np.where(train_result['EverD60CO_Sep2025'] == 1, 0, train_result['EverD60CO_Mar2026'])
-
+    train_result = add_additional_columns_for_plotting_prediction_results(df, train_result, bal_col='Dec2023Bal')
+    test_result = add_additional_columns_for_plotting_prediction_results(df, test_result, bal_col='Dec2023Bal')
 
     agg_model_train, agg_bcq_train = plot_prediction_results(train_result, bal_col=bal_col, bad_col='EverD60CO_Sep2025', score_col=score_col, n_deciles=n_deciles, 
         title = 'Train Set (Loan Count {:,.0f}) cut off 9/30/2025\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(train_result)))
