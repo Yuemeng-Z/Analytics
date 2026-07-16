@@ -449,12 +449,38 @@ def get_wt_distribution(df, col, vintage, weight_by = 'Amount Financed', show_to
     if sort_by_col and sort_by_col in wt_distribution.columns:
         wt_distribution = wt_distribution.sort_values(by=sort_by_col, ascending=False)
     if format_pct:
-        wt_distribution = wt_distribution.applymap(lambda x: f"{x:.2%}")
+        wt_distribution = wt_distribution.map(lambda x: f"{x:.2%}")
     if show_total_origination:
         wt_distribution.loc['Total Origination'] = np.array(wt_distribution_.sum(axis=0))
     
     return wt_distribution
 
+
+def group_tail_categories(df, col, weight_col, max_categories=None, other_label="Other"):
+    """
+    Keep the largest categories by total weight and group the remaining categories.
+    """
+    if max_categories is None:
+        return df
+
+    if max_categories < 1:
+        raise ValueError("max_categories must be at least 1.")
+
+    out = df.copy()
+    total_weight_by_category = out.groupby(col, dropna=False)[weight_col].sum()
+
+    if len(total_weight_by_category) <= max_categories:
+        return out
+
+    top_categories = set(
+        total_weight_by_category
+        .sort_values(ascending=False)
+        .head(max_categories)
+        .index
+    )
+
+    out[col] = out[col].where(out[col].isin(top_categories), other_label)
+    return out
 
 def plot_distribution_vs_total_volume(
     distribution_df,
@@ -471,6 +497,8 @@ def plot_distribution_vs_total_volume(
     marker="o",
     linewidth=2,
     legend_location="upper left",
+    legend_bbox_to_anchor=None,
+    legend_ncol=1,
     distribution_y_min=None,
     distribution_y_max=None,
     volume_y_min=None,
@@ -591,6 +619,8 @@ def plot_distribution_vs_total_volume(
         left_labels + right_labels,
         frameon=False,
         loc=legend_location,
+        bbox_to_anchor=legend_bbox_to_anchor,
+        ncol=legend_ncol,
         fontsize=legend_fontsize,
     )
 
@@ -599,6 +629,124 @@ def plot_distribution_vs_total_volume(
         plt.show()
 
     return fig, ax_left, ax_right
+
+
+def plot_distribution_stacked_bar(
+    distribution_df,
+    total_volume_row="Total Origination",
+    title="Distribution",
+    x_label="",
+    distribution_ylabel="Distribution",
+    category_label_format="{category}",
+    figsize=(12, 6),
+    colors=None,
+    edge_color="white",
+    edge_linewidth=0.4,
+    legend_location="upper left",
+    legend_bbox_to_anchor=None,
+    legend_ncol=1,
+    distribution_y_min=None,
+    distribution_y_max=None,
+    title_fontsize=16,
+    label_fontsize=13,
+    tick_fontsize=11,
+    legend_fontsize=11,
+    show=True,
+):
+    """
+    Plot a weighted distribution table as stacked bars.
+
+    If a total volume row is present, it is excluded from the stacked bars.
+    """
+    chart_df = distribution_df.copy()
+    if total_volume_row in chart_df.index:
+        chart_df = chart_df.drop(index=total_volume_row)
+
+    def _parse_number_series(series):
+        return pd.to_numeric(
+            series.astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.replace("%", "", regex=False),
+            errors="coerce",
+        )
+
+    def _parse_distribution_series(series):
+        text_values = series.astype(str)
+        numeric_values = _parse_number_series(series)
+        non_null_values = numeric_values.dropna().abs()
+
+        has_percent_sign = text_values.str.contains("%", regex=False).any()
+        looks_like_whole_number_pct = (
+            not non_null_values.empty
+            and non_null_values.quantile(0.90) > 1
+            and non_null_values.quantile(0.90) <= 100
+        )
+        if has_percent_sign or looks_like_whole_number_pct:
+            numeric_values = numeric_values / 100
+
+        return numeric_values
+
+    distribution = chart_df.T.apply(_parse_distribution_series).fillna(0)
+    x_labels = distribution.index.astype(str)
+    x = np.arange(len(x_labels))
+
+    fig, ax = plt.subplots(figsize=figsize)
+    bottom = np.zeros(len(distribution))
+    default_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    if not default_colors:
+        default_colors = ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
+    if colors is None:
+        colors = default_colors
+    elif isinstance(colors, str):
+        colors = [colors]
+    else:
+        colors = list(colors)
+    if not colors:
+        colors = default_colors
+
+    for i, category in enumerate(distribution.columns):
+        values = distribution[category].values
+        ax.bar(
+            x,
+            values,
+            bottom=bottom,
+            color=colors[i % len(colors)],
+            edgecolor=edge_color,
+            linewidth=edge_linewidth,
+            label=category_label_format.format(category=category),
+        )
+        bottom = bottom + values
+
+    ax.set_title(title, fontsize=title_fontsize, weight="bold", loc="left")
+    ax.set_xlabel(x_label, fontsize=label_fontsize)
+    ax.set_ylabel(distribution_ylabel, fontsize=label_fontsize)
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=tick_fontsize)
+    ax.tick_params(axis="y", labelsize=tick_fontsize)
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+    ax.grid(axis="y", alpha=0.25)
+
+    if distribution_y_min is not None or distribution_y_max is not None:
+        current_min, current_max = ax.get_ylim()
+        ax.set_ylim(
+            distribution_y_min if distribution_y_min is not None else current_min,
+            distribution_y_max if distribution_y_max is not None else current_max,
+        )
+
+    ax.legend(
+        frameon=False,
+        loc=legend_location,
+        bbox_to_anchor=legend_bbox_to_anchor,
+        ncol=legend_ncol,
+        fontsize=legend_fontsize,
+    )
+
+    plt.tight_layout()
+    if show:
+        plt.show()
+
+    return fig, ax
 
 
 # def weighted_avg(df, cols, weight_col):
@@ -706,10 +854,28 @@ def plot_finance_style(df, title="Chart Title", ylabel="", percentage=True, deci
                         first_n_styles = None,
 
                         legend_cutoff_num = None,
-                        legend_location = "upper left"
+                        legend_location = "upper left",
+                        moving_average_window=None,
+                        moving_average_min_periods=1,
+                        trim_last_n=0
 
                        ):
     plt.style.use("default")
+
+    df = df.copy()
+
+    if moving_average_window is not None:
+        if moving_average_window < 1:
+            raise ValueError("moving_average_window must be at least 1.")
+        if moving_average_min_periods < 1:
+            raise ValueError("moving_average_min_periods must be at least 1.")
+        df = df.rolling(
+            window=moving_average_window,
+            min_periods=moving_average_min_periods,
+        ).mean()
+
+    if trim_last_n is not None and trim_last_n > 0:
+        df.iloc[-trim_last_n:, :] = np.nan
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -756,8 +922,8 @@ def plot_finance_style(df, title="Chart Title", ylabel="", percentage=True, deci
             linestyle = ':'
 
         target_ax.plot(
-            df.index,
-            df[col],
+            df.index.to_numpy(),
+            df[col].to_numpy(),
             color=color,
             linestyle=linestyle,
             linewidth=2,
@@ -1272,10 +1438,12 @@ def plot_metric_vs_volume(
     value_y_formatter=None,
     right_y_formatter=None,
     volume_display="background",
+    format_value_labels=True,
     title_fontsize=16,
     label_fontsize=13,
     tick_fontsize=12,
     legend_fontsize=12,
+    legend=True,
     show=True,
 ):
     """
@@ -1345,6 +1513,9 @@ def plot_metric_vs_volume(
     if missing_cols:
         raise ValueError(f"Missing columns for plotting: {missing_cols}")
 
+    def _display_label(col, format_label=True):
+        return format_column_label(col) if format_label else str(col)
+
     def _pick_color(colors, index, default_colors, key=None):
         if colors is None:
             return default_colors[index % len(default_colors)]
@@ -1357,12 +1528,15 @@ def plot_metric_vs_volume(
             return default_colors[index % len(default_colors)]
         return colors[index % len(colors)]
 
+    def _as_plot_numeric(series):
+        return pd.to_numeric(series, errors="coerce").astype("float64")
+
     plot_df = df.copy()
     if volume_display != "none":
         for col in volume_cols:
-            plot_df[col] = to_numeric_amount(plot_df[col])
+            plot_df[col] = _as_plot_numeric(to_numeric_amount(plot_df[col]))
     for col in value_cols + right_value_cols:
-        plot_df[col] = _coerce_weighted_avg_series(plot_df[col])
+        plot_df[col] = _as_plot_numeric(_coerce_weighted_avg_series(plot_df[col]))
 
     x_values = plot_df[x_col] if x_col is not None else plot_df.index
     x_labels = x_values.astype(str)
@@ -1373,7 +1547,7 @@ def plot_metric_vs_volume(
         volume_label = volume_ylabel or "Volume"
     x_axis_label = format_column_label(x_col) if x_col and x_label is None else (x_label or "")
 
-    column_labels = [format_column_label(col) for col in value_cols]
+    column_labels = [_display_label(col, format_value_labels) for col in value_cols]
     columns_label = ", ".join(column_labels)
     right_column_labels = [format_column_label(col) for col in right_value_cols]
     right_columns_label = ", ".join(right_column_labels)
@@ -1460,7 +1634,7 @@ def plot_metric_vs_volume(
             ax_right.tick_params(axis="y", labelsize=tick_fontsize)
 
     for col in value_cols:
-        col_label = format_column_label(col)
+        col_label = _display_label(col, format_value_labels)
         ax_left.plot(
             x,
             plot_df[col].values,
@@ -1559,13 +1733,14 @@ def plot_metric_vs_volume(
                 legend_handles.append(handle)
                 legend_labels.append(label)
 
-    ax_left.legend(
-        legend_handles,
-        legend_labels,
-        frameon=False,
-        loc=legend_location,
-        fontsize=legend_fontsize,
-    )
+    if legend:
+        ax_left.legend(
+            legend_handles,
+            legend_labels,
+            frameon=False,
+            loc=legend_location,
+            fontsize=legend_fontsize,
+        )
 
     plt.tight_layout()
     if show:
@@ -1587,7 +1762,6 @@ def plot_metric_vs_volume(
     charts.update({col: chart for col in volume_cols})
 
     return charts
-
 
 def plot_weighted_avg_by_group(
     df,
@@ -1710,6 +1884,120 @@ def plot_weighted_avg_by_group(
     return output_table
 
 
+def plot_weighted_missing_by_group(
+    df,
+    groupby_col,
+    cols_to_analyze,
+    weight_col,
+    mode="zero_or_nan",
+    total_volume_col="Total Origination Volume",
+    title=None,
+    x_label=None,
+    value_ylabel=None,
+    volume_ylabel="Total Origination Volume",
+    figsize=(12, 6),
+    volume_color="#d9e2ec",
+    volume_edge_color="#8aa2b8",
+    volume_alpha=0.45,
+    marker="o",
+    linewidth=2,
+    right_colors=None,
+    legend_location="upper left",
+    value_y_min=None,
+    value_y_max=None,
+    volume_y_min=None,
+    volume_y_max=None,
+    value_y_formatter="percent",
+    volume_display="background",
+    title_fontsize=16,
+    label_fontsize=13,
+    tick_fontsize=12,
+    legend_fontsize=12,
+    legend=True,
+    show=True,
+    return_results=False,
+):
+    """
+    Plot weighted missing/zero rates by group against total volume.
+
+    mode controls the definition of missing:
+    - "zero_or_nan": weighted share where value is zero or null
+    - "zero": weighted share where value is zero
+    - "nan": weighted share where value is null
+    """
+    if mode not in ["zero_or_nan", "zero", "nan"]:
+        raise ValueError("mode must be 'zero_or_nan', 'zero', or 'nan'")
+
+    missing_required = [col for col in [groupby_col, weight_col] if col not in df.columns]
+    if missing_required:
+        raise ValueError(f"Missing required columns: {missing_required}")
+
+    if isinstance(cols_to_analyze, str):
+        cols_to_analyze = [cols_to_analyze]
+
+    cols_to_analyze = filter_existing_columns(df, cols_to_analyze)
+    if not cols_to_analyze:
+        raise ValueError("No cols_to_analyze were found in the DataFrame.")
+
+    required_cols = filter_existing_columns(df, [groupby_col, weight_col] + cols_to_analyze)
+    work = df[required_cols].copy()
+    work[weight_col] = to_numeric_amount(work[weight_col])
+
+    weighted_missing_table = groupby_weighted_missing(
+        work,
+        groupby_col,
+        cols_to_analyze,
+        weight_col,
+        mode=mode,
+    )
+    total_volume = work.groupby(groupby_col)[weight_col].sum(min_count=1).rename(total_volume_col)
+    output_table = weighted_missing_table.join(total_volume, how="left")
+
+    x_axis_label = format_column_label(groupby_col) if x_label is None else x_label
+    charts = {}
+    for col in cols_to_analyze:
+        metric_col = f"{col}_{mode}_pct"
+        col_label = format_column_label(col)
+        col_charts = plot_metric_vs_volume(
+            output_table,
+            value_cols=metric_col,
+            volume_col=total_volume_col,
+            title=title or f"{col_label} Weighted Missing Rate vs {{volume}}",
+            x_label=x_axis_label,
+            value_ylabel=value_ylabel or f"{col_label} Weighted Missing Rate",
+            volume_ylabel=volume_ylabel,
+            figsize=figsize,
+            volume_color=volume_color,
+            volume_edge_color=volume_edge_color,
+            volume_alpha=volume_alpha,
+            marker=marker,
+            linewidth=linewidth,
+            right_colors=right_colors,
+            legend_location=legend_location,
+            value_y_min=value_y_min,
+            value_y_max=value_y_max,
+            volume_y_min=volume_y_min,
+            volume_y_max=volume_y_max,
+            value_y_formatter=value_y_formatter,
+            volume_display=volume_display,
+            title_fontsize=title_fontsize,
+            label_fontsize=label_fontsize,
+            tick_fontsize=tick_fontsize,
+            legend_fontsize=legend_fontsize,
+            legend=legend,
+            show=show,
+        )
+        charts[col] = col_charts[metric_col]
+
+    if return_results:
+        return {
+            "table": output_table,
+            "charts": charts,
+        }
+
+    return output_table
+
+
 def plot_distribution_for_categorical(
     df,
     cols_to_analyze,
@@ -1720,9 +2008,12 @@ def plot_distribution_for_categorical(
     volume_ylabel="Total Origination Volume",
     category_label_format="{category}",
     figsize=(12, 6),
+    plot_kind="line",
     sort_by_col=None,
     format_pct=True,
     show=True,
+    max_categories=None,
+    other_label="Other",
     **plot_kwargs,
 ):
     """
@@ -1731,18 +2022,43 @@ def plot_distribution_for_categorical(
 
     The input to plot_distribution_vs_total_volume is created inside this
     function using get_wt_distribution(..., show_total_origination=True).
+
+    If max_categories is provided, each analyzed column keeps its largest
+    categories by total weight and groups the rest into other_label.
+
+    plot_kind can be "line" for the existing line-plus-volume chart or
+    "stacked_bar" for stacked distribution bars without the volume axis.
     """
     if isinstance(cols_to_analyze, str):
         cols_to_analyze = [cols_to_analyze]
+
+    plot_kind_aliases = {
+        "line": "line",
+        "lines": "line",
+        "volume": "line",
+        "stacked": "stacked_bar",
+        "stacked_bar": "stacked_bar",
+        "bar": "stacked_bar",
+    }
+    if plot_kind not in plot_kind_aliases:
+        raise ValueError("plot_kind must be 'line' or 'stacked_bar'.")
+    plot_kind = plot_kind_aliases[plot_kind]
 
     results = {}
     x_axis_label = format_column_label(vintage_col) if x_label is None else x_label
 
     for col in cols_to_analyze:
         col_label = format_column_label(col)
+        plot_df = group_tail_categories(
+            df,
+            col,
+            weight_col,
+            max_categories=max_categories,
+            other_label=other_label,
+        )
 
         distribution_table = get_wt_distribution(
-            df,
+            plot_df,
             col,
             vintage_col,
             weight_by=weight_col,
@@ -1751,18 +2067,32 @@ def plot_distribution_for_categorical(
             sort_by_col=sort_by_col,
         )
 
-        fig, ax_left, ax_right = plot_distribution_vs_total_volume(
-            distribution_table,
-            total_volume_row=total_volume_row,
-            title=f"{col_label} Distribution vs Total Origination Volume",
-            x_label=x_axis_label,
-            distribution_ylabel=f"{col_label} Distribution",
-            volume_ylabel=volume_ylabel,
-            category_label_format=category_label_format,
-            figsize=figsize,
-            show=show,
-            **plot_kwargs,
-        )
+        if plot_kind == "stacked_bar":
+            fig, ax_left = plot_distribution_stacked_bar(
+                distribution_table,
+                total_volume_row=total_volume_row,
+                title=f"{col_label} Distribution",
+                x_label=x_axis_label,
+                distribution_ylabel=f"{col_label} Distribution",
+                category_label_format=category_label_format,
+                figsize=figsize,
+                show=show,
+                **plot_kwargs,
+            )
+            ax_right = None
+        else:
+            fig, ax_left, ax_right = plot_distribution_vs_total_volume(
+                distribution_table,
+                total_volume_row=total_volume_row,
+                title=f"{col_label} Distribution vs Total Origination Volume",
+                x_label=x_axis_label,
+                distribution_ylabel=f"{col_label} Distribution",
+                volume_ylabel=volume_ylabel,
+                category_label_format=category_label_format,
+                figsize=figsize,
+                show=show,
+                **plot_kwargs,
+            )
 
         results[col] = {
             "table": distribution_table,
@@ -1861,3 +2191,449 @@ def plot_correlation_simple(df, cols_for_corr, plot = True):
         plt.show()
 
     return corr
+
+
+def get_everd_co_table(df,
+                        everdqco_col,
+                        everd_col_output_col_name,
+                        groupby_col,
+                        weight_col,
+                        total_volume_col="Total Origination Volume",
+                        category_col=None,
+                        categories_to_plot=None,
+                        max_categories=None,
+                        other_label="Other",
+                        category_missing_label="Missing"):
+    required_cols = [groupby_col, weight_col, everdqco_col]
+    if category_col is not None:
+        required_cols.append(category_col)
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    work = df[required_cols].copy()
+    work[weight_col] = to_numeric_amount(work[weight_col])
+    work[everdqco_col] = pd.to_numeric(work[everdqco_col], errors="coerce").fillna(0)
+
+    if category_col is not None:
+        work[category_col] = work[category_col].astype("object").where(
+            work[category_col].notna(),
+            category_missing_label,
+        )
+
+        if categories_to_plot is not None:
+            if isinstance(categories_to_plot, str):
+                categories_to_plot = [categories_to_plot]
+            categories_to_plot = list(categories_to_plot)
+            keep_categories = set(categories_to_plot)
+        elif max_categories is not None:
+            if max_categories < 1:
+                raise ValueError("max_categories must be at least 1.")
+            categories_to_plot = (
+                work.groupby(category_col, dropna=False)[weight_col]
+                .sum()
+                .sort_values(ascending=False)
+                .head(max_categories)
+                .index
+                .tolist()
+            )
+            keep_categories = set(categories_to_plot)
+        else:
+            categories_to_plot = (
+                work.groupby(category_col, dropna=False)[weight_col]
+                .sum()
+                .sort_values(ascending=False)
+                .index
+                .tolist()
+            )
+            keep_categories = set(categories_to_plot)
+
+        work[category_col] = work[category_col].where(
+            work[category_col].isin(keep_categories),
+            other_label,
+        )
+
+    everd_weighted_col = f"{everdqco_col}_weighted"
+    work[everd_weighted_col] = work[everdqco_col] * work[weight_col]
+
+    if category_col is not None:
+        groupeddf = (
+            work.groupby([groupby_col, category_col], dropna=False)[[everd_weighted_col, weight_col]]
+            .sum()
+        )
+        groupeddf["everd_rate"] = (
+            groupeddf[everd_weighted_col] / groupeddf[weight_col].replace(0, np.nan)
+        )
+
+        rate_table = groupeddf["everd_rate"].unstack(category_col)
+        category_order = [category for category in categories_to_plot if category in rate_table.columns]
+        if other_label in rate_table.columns and other_label not in category_order:
+            category_order.append(other_label)
+        category_order.extend([category for category in rate_table.columns if category not in category_order])
+        rate_table = rate_table[category_order]
+        total_volume = work.groupby(groupby_col, dropna=False)[weight_col].sum().rename(total_volume_col)
+        return rate_table.join(total_volume, how="left")
+
+    groupeddf = work.groupby(groupby_col, dropna=False)[[everd_weighted_col, weight_col]].sum()
+    groupeddf = groupeddf.rename(columns={weight_col: total_volume_col})
+    groupeddf[everd_col_output_col_name] = (
+        groupeddf[everd_weighted_col] / groupeddf[total_volume_col].replace(0, np.nan)
+    )
+    output_table = groupeddf[[everd_col_output_col_name, total_volume_col]]
+    return output_table
+
+
+def plot_everd_column(
+    df,
+    everdqco_col,
+    everd_col_output_col_name,
+    groupby_col,
+    weight_col,
+    trim_n = None,
+    total_volume_col="Total Origination Volume",
+    category_col=None,
+    categories_to_plot=None,
+    max_categories=None,
+    other_label="Other",
+    category_missing_label="Missing",
+    title=None,
+    x_label=None,
+    value_ylabel=None,
+    volume_ylabel="Total Origination Volume",
+    figsize=(12, 6),
+    volume_color="#d9e2ec",
+    volume_edge_color="#8aa2b8",
+    volume_alpha=0.45,
+    marker="o",
+    linewidth=2,
+    right_colors=None,
+    legend_location="upper left",
+    value_y_min=None,
+    value_y_max=None,
+    volume_y_min=None,
+    volume_y_max=None,
+    value_y_formatter="percent",
+    volume_display="background",
+    title_fontsize=16,
+    label_fontsize=13,
+    tick_fontsize=12,
+    legend_fontsize=12,
+    show=True,
+    return_results=False,
+):
+
+    x_axis_label = format_column_label(groupby_col) if x_label is None else x_label
+    output_table = get_everd_co_table(
+        df,
+        everdqco_col=everdqco_col,
+        everd_col_output_col_name=everd_col_output_col_name,
+        groupby_col=groupby_col,
+        weight_col=weight_col,
+        total_volume_col=total_volume_col,
+        category_col=category_col,
+        categories_to_plot=categories_to_plot,
+        max_categories=max_categories,
+        other_label=other_label,
+        category_missing_label=category_missing_label,
+    )
+    value_cols = [col for col in output_table.columns if col != total_volume_col]
+    plot_title = title
+    if plot_title is None:
+        if category_col is not None:
+            plot_title = (
+                f"{everd_col_output_col_name} by {format_column_label(category_col)} vs {{volume}}"
+            )
+        else:
+            plot_title = f"{everd_col_output_col_name} vs {{volume}}"
+
+    if trim_n is not None and trim_n > 0:
+        output_table.loc[
+            output_table.index[-trim_n:],
+            value_cols
+        ] = np.nan
+
+    charts = plot_metric_vs_volume(
+        output_table,
+        value_cols=value_cols,
+        volume_col=total_volume_col,
+        title=plot_title,
+        x_label=x_axis_label,
+        value_ylabel=value_ylabel or everd_col_output_col_name,
+        volume_ylabel=volume_ylabel,
+        figsize=figsize,
+        volume_color=volume_color,
+        volume_edge_color=volume_edge_color,
+        volume_alpha=volume_alpha,
+        marker=marker,
+        linewidth=linewidth,
+        right_colors=right_colors,
+        legend_location=legend_location,
+        value_y_min=value_y_min,
+        value_y_max=value_y_max,
+        volume_y_min=volume_y_min,
+        volume_y_max=volume_y_max,
+        value_y_formatter=value_y_formatter,
+        volume_display=volume_display,
+        format_value_labels=category_col is None,
+        title_fontsize=title_fontsize,
+        label_fontsize=label_fontsize,
+        tick_fontsize=tick_fontsize,
+        legend_fontsize=legend_fontsize,
+        show=show,
+    )
+
+    if return_results:
+        return {
+            "table": output_table,
+            "charts": charts,
+        }
+
+    return output_table
+
+
+def add_normalized_interest_rate(
+    df,
+    rate_col="Booking_Interest_Rate",
+    weight_col="Booked_Amount",
+    vintage_col="vintage_quarter",
+    output_col="normalized_interest_rate",
+    benchmark_col="weighted_vintage_rate",
+):
+    out = df.copy()
+
+    out[rate_col] = pd.to_numeric(out[rate_col], errors="coerce")
+    out[weight_col] = pd.to_numeric(out[weight_col], errors="coerce")
+
+    valid = (
+        out[rate_col].notna()
+        & out[weight_col].notna()
+        & (out[weight_col] > 0)
+        & out[vintage_col].notna()
+    )
+
+    vintage_rates = (
+        out.loc[valid]
+        .assign(_rate_x_weight=lambda x: x[rate_col] * x[weight_col])
+        .groupby(vintage_col, as_index=False)
+        .agg(
+            _rate_x_weight_sum=("_rate_x_weight", "sum"),
+            _weight_sum=(weight_col, "sum"),
+        )
+    )
+
+    vintage_rates[benchmark_col] = (
+        vintage_rates["_rate_x_weight_sum"] / vintage_rates["_weight_sum"]
+    )
+
+    out = out.merge(
+        vintage_rates[[vintage_col, benchmark_col]],
+        on=vintage_col,
+        how="left",
+    )
+
+    out[output_col] = out[rate_col] - out[benchmark_col]
+
+    return out
+
+
+def trim_last_n_values(df, cols, n=1, inplace=False):
+    """
+    Set the last n rows of selected columns to NaN.
+    Useful for hiding incomplete recent periods in plots.
+    """
+    if n is None or n <= 0:
+        return df if inplace else df.copy()
+
+    out = df if inplace else df.copy()
+
+    if isinstance(cols, str):
+        cols = [cols]
+
+    cols = [col for col in cols if col in out.columns]
+
+    if not cols:
+        return out
+
+    out.loc[out.index[-n:], cols] = np.nan
+    return out
+
+
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
+def plot_one_visualization_decile_everdq_distribution(df, 
+                                                      col,
+                                                      everD_co_col,
+                                                      orig_bal_col, 
+                                                      breakpoints=None, 
+                                                      n_bins=10,
+                                                      top_n_categories=None,
+                                                      other_label="Other",
+                                                      category_order=None,
+                                                      category_sort_ascending=False,
+                                                      title=None,
+                                                      y_label=None,
+                                                      figsize=(11, 5)):
+
+    display_col = col.replace("_Bucket", "").replace("_", " ")
+    s = df[col]
+    n_unique = s.nunique(dropna=True)
+    is_categorical = (s.dtype == "object") or (s.dtype.name == "category")
+
+    # ---------- CASE 1: categorical or <= 10 unique values ----------
+    if breakpoints is None and (is_categorical or n_unique <= 10):
+        plot_df = df.copy()
+        plot_col = col
+
+        if top_n_categories is not None:
+            if top_n_categories < 1:
+                raise ValueError("top_n_categories must be at least 1.")
+
+            plot_col = f"_{col}_plot_category"
+            top_categories = (
+                plot_df.groupby(col, dropna=False)[orig_bal_col]
+                .sum()
+                .sort_values(ascending=False)
+                .head(top_n_categories)
+                .index
+            )
+            plot_df[plot_col] = plot_df[col].where(
+                plot_df[col].isin(top_categories),
+                other_label,
+            )
+
+        grouped = plot_df.groupby(plot_col, dropna=False, sort=False)
+        total_bal = grouped[orig_bal_col].sum()
+        bad_bal = (
+            plot_df.loc[plot_df[everD_co_col] == 1]
+            .groupby(plot_col, dropna=False)[orig_bal_col]
+            .sum()
+        )
+        pct = bad_bal.reindex(total_bal.index, fill_value=0).div(total_bal).fillna(0)
+        counts = grouped.size().reindex(pct.index)
+
+        if category_order is not None:
+            if isinstance(category_order, str):
+                sort_key = category_order.lower()
+                if sort_key in ["rate", "pct", "everd", "everdq"]:
+                    ordered_index = pct.sort_values(ascending=category_sort_ascending).index
+                elif sort_key in ["count", "n"]:
+                    ordered_index = list(counts.sort_values(ascending=category_sort_ascending).index)
+                    if other_label in ordered_index:
+                        ordered_index = [value for value in ordered_index if value != other_label]
+                        ordered_index.append(other_label)
+                elif sort_key in ["balance", "bal", "volume", "orig_bal"]:
+                    ordered_index = total_bal.sort_values(ascending=category_sort_ascending).index
+                elif sort_key in ["alpha", "alphabetical", "name"]:
+                    ordered_index = sorted(pct.index, key=lambda x: str(x))
+                    if not category_sort_ascending:
+                        ordered_index = list(reversed(ordered_index))
+                else:
+                    raise ValueError(
+                        "category_order must be a list or one of: "
+                        "'rate', 'count', 'balance', 'alpha'."
+                    )
+            else:
+                manual_order = list(category_order)
+                ordered_index = [value for value in manual_order if value in pct.index]
+                ordered_index += [value for value in pct.index if value not in ordered_index]
+
+            pct = pct.reindex(ordered_index)
+            counts = counts.reindex(ordered_index)
+
+        plt.figure(figsize=figsize)
+        ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
+        ymax = pct.max() if len(pct) else 0
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
+        ax.set_ylabel(y_label or f"DQ60/CO% of {orig_bal_col}")
+        ax.set_xlabel("")
+        ax.set_title(title or f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
+
+        # Add sample size above bars
+        for i, value in enumerate(pct):
+            ax.text(
+                i,
+                value + (ymax * 0.03 if ymax > 0 else 0.002),
+                f"{value:.1%}\nn={counts.iloc[i]:,}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        plt.show()
+
+    # ---------- CASE 2: numeric with > 10 values ----------
+    else:
+        numeric_s = pd.to_numeric(s, errors="coerce")
+        valid = df[numeric_s.notna()].copy()
+        numeric_s = numeric_s[numeric_s.notna()]
+
+        if numeric_s.nunique() == 0:
+            return
+
+        if breakpoints is not None:
+            data_min = numeric_s.min()
+            data_max = numeric_s.max()
+            breakpoint_values = (
+                pd.Series(breakpoints, dtype="float64")
+                .dropna()
+                .sort_values()
+                .unique()
+            )
+            breakpoint_values = [
+                value for value in breakpoint_values
+                if data_min < value < data_max
+            ]
+            cut_bins = [data_min] + breakpoint_values + [data_max]
+            bins = pd.cut(numeric_s, bins=cut_bins, include_lowest=True)
+        else:
+            try:
+                bins = pd.qcut(numeric_s, q=n_bins, duplicates="drop")
+            except ValueError:
+                bins = pd.cut(numeric_s, bins=n_bins)
+
+        valid["_bin"] = bins
+
+        grouped = valid.groupby("_bin", dropna=False)
+        total_bal = grouped[orig_bal_col].sum()
+        bad_bal = (
+            valid.loc[valid[everD_co_col] == 1]
+            .groupby("_bin", dropna=False)[orig_bal_col]
+            .sum()
+        )
+        pct = bad_bal.reindex(total_bal.index, fill_value=0).div(total_bal).fillna(0)
+        counts = grouped.size().reindex(pct.index)
+
+        plt.figure(figsize=figsize)
+        ax = pct.plot(kind="bar", color="#4C78A8", edgecolor="white", width=0.8)
+        ymax = pct.max() if len(pct) else 0
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=1))
+        ax.set_ylabel(y_label or f"DQ60/CO% of {orig_bal_col}")
+        ax.set_xlabel("")
+        ax.set_title(title or f"DQ60/CO Rate by {display_col}", fontsize=13, weight="bold")
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 0.05)
+
+        # Add sample size text
+        for i, value in enumerate(pct):
+            ax.text(
+                i,
+                value + (ymax * 0.03 if ymax > 0 else 0.002),
+                f"{value:.1%}\nn={counts.iloc[i]:,}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        plt.show()

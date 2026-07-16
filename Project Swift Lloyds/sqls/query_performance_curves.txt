@@ -1,0 +1,166 @@
+with SegmentationFinal as (
+SELECT
+    CASE 
+        WHEN b.PDModelScoreSegment IS NOT NULL THEN 
+            b.[PDModelScoreSegment]
+        WHEN b.PDModelScoreSegment IS NULL
+             AND a.Number_Of_Days_In_Arrears BETWEEN 11 AND 29 THEN '11-29 DPD'
+        WHEN b.PDModelScoreSegment IS NULL
+             AND a.Number_Of_Days_In_Arrears BETWEEN 30 AND 59 THEN '30-59 DPD'
+        WHEN b.PDModelScoreSegment IS NULL
+             AND a.Number_Of_Days_In_Arrears BETWEEN 60 AND 89 THEN '60-89 DPD'
+        WHEN b.PDModelScoreSegment IS NULL
+             AND a.Number_Of_Days_In_Arrears BETWEEN 90 AND 119 THEN '90-119 DPD'
+        WHEN b.PDModelScoreSegment IS NULL
+             AND a.Number_Of_Days_In_Arrears >= 120 THEN '120+ DPD'
+        WHEN b.PDModelScoreSegment IS NULL
+            -- AND (a.Number_Of_Days_In_Arrears <= 0 OR a.Number_Of_Days_In_Arrears IS NULL)
+             AND a.Origination_Date > '2023-07-31' THEN 'Post-20230731 no model segment'        
+        ELSE 'Unable to match segment'
+    END AS Final_PD_Segment,
+    a.New_Underlying_Exposure_Identifier,
+	b.predictions AS bv_model_score,
+	b.PD_Model_Score_Decile,
+	b.Borrower_Credit_Quality_Decile
+FROM [ConsumerLoans].[dbo].[PERFF1_Dynamic_Mar2026] AS a
+LEFT JOIN [ConsumerLoans].[dbo].[PERFF1_ModelScore_V1_07142025] AS b
+    ON a.New_Underlying_Exposure_Identifier = b.New_Underlying_Exposure_Identifier
+WHERE a.Data_Cut_Off_Date = '2023-12-31'
+    AND a.Number_Of_Days_In_Arrears <= 0
+    AND a.Account_Status = 'PERF'
+    AND DATEDIFF(MONTH, a.Pool_Cut_Off_Date, a.Maturity_Date) >= 12
+    AND a.Origination_Date <= '2023-07-31'
+)
+SELECT 
+      Final_PD_Segment
+    , Data_Cut_Off_Date
+    , loan_count
+	, PD_Model_Score_Decile
+	, min_score
+	, max_score
+	, avg_score
+    , BegUPB
+    , UPB
+    , DefaultBal
+    , D30pUPB
+    , Prepayment
+	, Prepayment_orig
+    , SchedPrin
+	, SchedPrin_orig
+	, prin_payment
+	, prin_payment_orig
+    , (1 - POWER(1 - DefaultBal / BegUPB, 12)) * 100 AS CDR
+    , (1 - POWER(1 - Prepayment / (BegUPB - SchedPrin), 12)) * 100 AS CPR
+	, (1 - POWER(1 - Prepayment_orig / (BegUPB - SchedPrin_orig), 12)) * 100 AS CPR_orig
+    , SUM(COALESCE(DefaultBal, 0)) OVER (
+          PARTITION BY Final_PD_Segment
+          ORDER BY Data_Cut_Off_Date
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) AS cum_gross_default
+    , NULLIF(
+          MAX(CASE 
+                  WHEN Data_Cut_Off_Date = '2023-12-31' 
+                  THEN UPB 
+              END) OVER (
+                  PARTITION BY Final_PD_Segment
+              ),
+          0
+      ) AS Dec2023Bal
+    , MAX(CASE 
+            WHEN Data_Cut_Off_Date = '2023-12-31' THEN UPB 
+        END) OVER (
+            PARTITION BY Final_PD_Segment
+    ) AS OriginalLoanBalance
+
+    , SUM(COALESCE(DefaultBal, 0)) OVER (
+            PARTITION BY Final_PD_Segment
+            ORDER BY Data_Cut_Off_Date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )
+    / NULLIF(
+        MAX(CASE 
+                WHEN Data_Cut_Off_Date = '2023-12-31' THEN UPB 
+            END) OVER (
+                PARTITION BY Final_PD_Segment
+        ),
+        0
+        ) AS CGL
+
+    , UPB / MAX(CASE 
+            WHEN Data_Cut_Off_Date = '2023-12-31' THEN UPB 
+        END) OVER (
+            PARTITION BY Final_PD_Segment
+    ) AS Factor
+FROM
+(
+SELECT 
+    Final_PD_Segment, 
+    Data_Cut_Off_Date,
+    COUNT(*) as loan_count,
+    AVG(PD_Model_Score_Decile) AS PD_Model_Score_Decile,
+    MIN(bv_model_score) AS min_score,
+    MAX(bv_model_score) AS max_score,
+    AVG(bv_model_score) AS avg_score,
+    SUM(BOP_BAL) as BegUPB,
+    SUM(EOP_BAL) as UPB,
+    SUM(default_bal) as DefaultBal,
+    SUM(case when Number_Of_Days_In_Arrears > 30 then (case when hasdefaulted = 1 then 0 else BOP_BAL end) else 0 end) as D30pUPB,
+	SUM(prin_payment_calc- (SchedPayment - SchedInterest)) as Prepayment,
+    SUM(case when PrincipalPayment - SchedPrin > 0 then PrincipalPayment - SchedPrin else 0 end) as Prepayment_orig,
+	SUM(prin_payment_calc) AS prin_payment,
+	SUM(PrincipalPayment) AS prin_payment_orig,
+	SUM(SchedPayment - SchedInterest) AS SchedPrin,
+	SUM(SchedPrin) AS SchedPrin_orig
+FROM
+	(
+		SELECT 
+				a.*
+			,   b.Final_PD_Segment
+			,	b.Borrower_Credit_Quality_Decile
+			,	b.bv_model_score
+			,	b.PD_Model_Score_Decile
+			,	BOP_BAL - EOP_BAL - default_bal AS prin_payment_calc
+			,   CASE
+				  WHEN BOP_BAL <= 0 THEN 0
+				  WHEN Current_Interest_Rate IS NULL THEN 0
+				  ELSE BOP_BAL * (Current_Interest_Rate / 100.0 / 12.0)
+			  END AS SchedInterest
+
+			, CASE
+				  WHEN BOP_BAL <= 0 THEN 0
+				  WHEN Current_Interest_Rate IS NULL THEN 0
+				  WHEN DATEDIFF(MONTH, Data_Cut_Off_Date, Maturity_Date) <= 0 THEN 0
+				  WHEN Current_Interest_Rate = 0 THEN
+					  BOP_BAL
+					  / NULLIF(DATEDIFF(MONTH, Data_Cut_Off_Date, Maturity_Date), 0)
+				  ELSE
+					  (Current_Interest_Rate / 100.0 / 12.0)
+					  * BOP_BAL
+					  / NULLIF(
+						  1 - POWER(
+							  1 + (Current_Interest_Rate / 100.0 / 12.0),
+							  -DATEDIFF(MONTH, Data_Cut_Off_Date, Maturity_Date)
+						  ),
+						  0
+					  )
+			  END AS SchedPayment
+		FROM
+			(SELECT 
+					*
+				,	CASE WHEN hasdefaulted = 1 and FirstTimeDefault = 0 THEN 0 ELSE begUPB END AS BOP_BAL
+				,	CASE WHEN hasdefaulted = 1 THEN 0 ELSE Current_Principal_Balance END AS EOP_BAL
+				,	CASE WHEN FirstTimeDefault = 1 THEN BegUPB ELSE 0 END AS default_bal
+			FROM
+			[ConsumerLoans].[dbo].[PERFF1_Dynamic_Mar2026]
+			) a 
+		JOIN 
+			SegmentationFinal b
+		ON 
+			a.New_Underlying_Exposure_Identifier = b.New_Underlying_Exposure_Identifier
+		WHERE 
+			a.New_Underlying_Exposure_Identifier IN (SELECT New_Underlying_Exposure_Identifier FROM SegmentationFinal)
+	) t_1
+GROUP BY 
+    Final_PD_Segment, Data_Cut_Off_Date
+) t_2
+ORDER BY Final_PD_Segment, Data_Cut_Off_Date,  PD_Model_Score_Decile

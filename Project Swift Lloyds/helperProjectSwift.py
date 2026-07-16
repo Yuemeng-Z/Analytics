@@ -3,6 +3,10 @@ import pandas as pd
 
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
+from parentHelpers import plot_finance_style
+import matplotlib.ticker as mtick
+import matplotlib.dates as mdates
+
 
 EMPLOYMENT_STATUS_BUCKETS = {
     "EMRS": "EMRS - Employed, private sector",
@@ -15,6 +19,12 @@ EMPLOYMENT_STATUS_BUCKETS = {
     "STNT": "STNT - Student",
     "PNNR": "PNNR - Pensioner",
     "OTHR": "OTHR - Other",
+
+    "ND":  "OTHR - Other",
+    "9": "PNNR - Pensioner",
+    "10": "OTHR - Other",
+    "6": "SFEM - Self-employed",
+    "1": "EMUK - Employed, sector unknown"
 }
 
 ORIGINATION_CHANNEL_BUCKETS = {
@@ -43,6 +53,11 @@ PURPOSE_BUCKETS = {
     "EQUP": "EQUP - Equipment",
     "PROP": "PROP - Property",
     "OTHR": "OTHR - Other",
+    '13': "OTHR - Other",
+    '7': "DCON - Debt Consolidation",
+    '10': "OTHV - Other Vehicle",
+    '6': "TRVL - Travel",
+    '4': "HIMP - Home Improvement"
 }
 
 RESIDENT_BUCKETS = {
@@ -74,15 +89,30 @@ def _format_region_label(value):
 
 
 def add_employment_status_bucket(df):
-    if "Employment_Status" not in df.columns:
+    if ("Employment_Status" not in df.columns) and ("Borrower_Employment_Status" not in df.columns):
         return df.copy()
 
     result = df.copy()
-    result["Employment_Status_Bucket"] = _map_code_bucket(
-        result["Employment_Status"],
-        EMPLOYMENT_STATUS_BUCKETS,
-        "Unknown employment status code",
-    )
+
+    if "Borrower_Employment_Status" in result.columns:
+        result["Employment_Status_Bucket"] = _map_code_bucket(
+            result["Borrower_Employment_Status"],
+            EMPLOYMENT_STATUS_BUCKETS,
+            "Unknown employment status code",
+        )
+    else:
+        result["Employment_Status_Bucket"] = _map_code_bucket(
+            result["Employment_Status"],
+            EMPLOYMENT_STATUS_BUCKETS,
+            "Unknown employment status code",
+        )
+
+    if "Borrower_Employment_Status" in result.columns:
+            result["Employment_Status_Bucket"] = _map_code_bucket(
+            result["Borrower_Employment_Status"],
+            EMPLOYMENT_STATUS_BUCKETS,
+            "Unknown employment status code",
+        )
 
     return result
 
@@ -104,6 +134,13 @@ def add_readable_category_buckets(df):
             "Unknown purpose code",
         )
 
+    if "LOANS_PURPOSE" in result.columns:
+        result["Loan_Purpose_Mapped_Bucket"] = _map_code_bucket(
+            result["LOANS_PURPOSE"],
+            PURPOSE_BUCKETS,
+            "Unknown purpose code",
+        )
+
     if "Loan_Purpose_Mapped" in result.columns:
         result["Loan_Purpose_Mapped_Bucket"] = _map_code_bucket(
             result["Loan_Purpose_Mapped"],
@@ -121,6 +158,11 @@ def add_readable_category_buckets(df):
     if "Post Code Region Application" in result.columns:
         result["Post Code Region Application_Bucket"] = (
             result["Post Code Region Application"].map(_format_region_label)
+        )
+
+    if "Geographic_Region" in result.columns:
+        result["Post Code Region Application_Bucket"] = (
+            result["Geographic_Region"].map(_format_region_label)
         )
 
     return result
@@ -582,3 +624,236 @@ def plot_all_prediction_results(df, test_result, train_result, score_col='y_pred
 
     agg_model_test, agg_bcq_test = plot_prediction_results(test_result, bal_col=bal_col, bad_col='EverD60CO_Sep2025', score_col=score_col, n_deciles=n_deciles, 
             title = 'Test Set (Loan Count {:,.0f}) cut off 9/30/2025\nBalance-Weighted EverD60CO by Decile\nModel Score vs Borrower Credit Quality'.format(len(test_result)))
+
+
+def clean_bulk_tape(df_bulk_tape, weighted_quarter_rate_mapping_training):
+    # Merge back to original LoanTape
+    print('Duplicated Loan Count: ',
+    df_bulk_tape.shape[0] - df_bulk_tape['Loan_Identifier'].nunique()
+    )
+
+    df_bulk_tape = df_bulk_tape.drop_duplicates(
+        subset=['Loan_Identifier'],
+        keep='first'
+    )
+
+    print('Final Loan Tape Shape: ', df_bulk_tape.shape)
+
+    df_bulk_tape = df_bulk_tape[['Loan_Identifier', 
+                                 
+                                    'Borrower_Identifier',
+                                    'Borrower_Credit_Quality', 
+                                    'Borrower_Employment_Status',
+                                    'Primary_Income', 
+                                    'Geographic_Region', 
+                                    'Origination_Date',
+                                    'Maturity_Date', 
+                                    'Original_Loan_Term', 
+                                    'Remaining_Loan_Term',
+                                    'Loan_Age', 
+                                    'Origination_Balance', 
+                                    'Current_Balance',
+                                    'Scheduled_Payment_Due', 
+                                    'LOANS_PURPOSE', 
+                                    'Annual_Percentage_Rate',
+                                    'Current_Interest_Rate', 
+                                    'Number_of_Borrowers', 
+                                    'Resident',
+                                    'Set_Off_Amount'
+                            ]]
+
+    df_bulk_tape = add_readable_category_buckets(df_bulk_tape)
+    # print('Added readable category buckets.', df_bulk_tape.columns)
+
+    df_bulk_tape['Origination_Date'] = pd.to_datetime(df_bulk_tape['Origination_Date'], errors='coerce')
+
+    df_bulk_tape['Origination_Quarter'] = (
+        df_bulk_tape['Origination_Date'].dt.to_period('Q').astype(str)
+    )
+
+    quarter_avg_rate = (
+        df_bulk_tape
+        .groupby('Origination_Quarter')
+        .apply(lambda g: np.average(g['Current_Interest_Rate'], 
+                                    weights=g['Current_Balance']))
+        .rename('weighted_quarter_rate')
+        .reset_index()
+    )
+
+    quarter_avg_rate = quarter_avg_rate.merge(weighted_quarter_rate_mapping_training, 
+                        on='Origination_Quarter', 
+                        how='left',
+                        suffixes=('_quarter_avg', '_training'))
+
+    quarter_avg_rate['weighted_quarter_rate'] = quarter_avg_rate['weighted_quarter_rate_training'].combine_first(quarter_avg_rate['weighted_quarter_rate_quarter_avg'])
+
+    df_bulk_tape = df_bulk_tape.merge(quarter_avg_rate, on='Origination_Quarter', how='left')
+
+    df_bulk_tape['normalized_interest_rate'] = (
+            df_bulk_tape['Current_Interest_Rate'] - df_bulk_tape['weighted_quarter_rate']
+        )
+
+
+    r = df_bulk_tape['Current_Interest_Rate'] / 100 / 12
+    n = df_bulk_tape['Original_Loan_Term']
+    bal = df_bulk_tape['Origination_Balance']
+
+    # Monthly payment formula, with zero-rate handling
+    df_bulk_tape['MonthlyPayment'] = np.where(
+        r == 0,
+        bal / n,                                       # zero-interest case
+        r * bal / (1 - (1 + r)**(-n))                  # standard amortization
+    )
+
+    df_bulk_tape['PTI'] = df_bulk_tape['MonthlyPayment'] / df_bulk_tape['Primary_Income'] * 12 * 100
+
+    df_bulk_tape['Has 2 Borrowers'] = np.where(df_bulk_tape['Number_of_Borrowers'] == 2, 1, 0)
+    df_bulk_tape['Has 2 Borrowers x Borrower Credit Quality'] = df_bulk_tape['Has 2 Borrowers'] * df_bulk_tape['Borrower_Credit_Quality']
+
+    df_bulk_tape['Has 1 Borrowers'] = np.where(df_bulk_tape['Number_of_Borrowers'] == 1, 1, 0)
+    df_bulk_tape['Has 1 Borrowers x Borrower Credit Quality'] = df_bulk_tape['Has 1 Borrowers'] * df_bulk_tape['Borrower_Credit_Quality']
+
+    df_bulk_tape.rename(columns={'Number_of_Borrowers': 'Number of Borrowers'}, inplace=True)
+    df_bulk_tape.rename(columns={'Original_Loan_Term': 'Original_Term'}, inplace=True)
+    df_bulk_tape.rename(columns={'Loan_Age': 'LoanAgeDec2023'}, inplace=True)
+    df_bulk_tape.rename(columns={'Set_Off_Amount': 'Set off amount'}, inplace=True)
+    return df_bulk_tape
+
+
+def plot_pivot_small_multiples(
+    pivot_df,
+    assumption_df=None,
+    metric_name="CPR",
+    segments=None,
+    date_col=None,
+    assumption_date_col=None,
+    is_percent=True,
+    percent_input="decimal",   # "decimal" if 0.05 = 5%, "whole" if 5 = 5%
+    moving_average_window=None,
+    trim_last_n=0,
+    nrows=2,
+    ncols=5,
+    figsize=(18, 8),
+    realized_label="Realized",
+    assumption_label="Assumption",
+    show_legend=True,
+):
+    def prep_date_index(df, date_col_input=None):
+        df = df.copy()
+
+        if date_col_input is not None:
+            df[date_col_input] = pd.to_datetime(df[date_col_input])
+            df = df.set_index(date_col_input)
+        elif "Data_Cut_Off_Date" in df.columns:
+            df["Data_Cut_Off_Date"] = pd.to_datetime(df["Data_Cut_Off_Date"])
+            df = df.set_index("Data_Cut_Off_Date")
+        else:
+            df.index = pd.to_datetime(df.index)
+
+        return df.sort_index()
+
+    plot_df = prep_date_index(pivot_df, date_col)
+
+    if assumption_df is not None:
+        assumption_plot_df = prep_date_index(assumption_df, assumption_date_col)
+    else:
+        assumption_plot_df = None
+
+    if segments is None:
+        segments = list(plot_df.columns[: nrows * ncols])
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=figsize,
+        sharex=True,
+        sharey=False
+    )
+
+    axes = np.asarray(axes).flatten()
+
+    for ax, seg in zip(axes, segments):
+        y_realized = pd.to_numeric(plot_df[seg], errors="coerce").copy()
+
+        if moving_average_window is not None:
+            y_realized = y_realized.rolling(moving_average_window, min_periods=1).mean()
+
+        if trim_last_n and trim_last_n > 0:
+            y_realized.iloc[-trim_last_n:] = np.nan
+
+        ax.plot(
+            plot_df.index.to_numpy(),
+            y_realized.to_numpy(dtype=float),
+            linewidth=2,
+            color="#1f4e79",
+            label=realized_label
+        )
+
+        if assumption_plot_df is not None and seg in assumption_plot_df.columns:
+            y_assumption = pd.to_numeric(assumption_plot_df[seg], errors="coerce").copy()
+
+            ax.plot(
+                assumption_plot_df.index.to_numpy(),
+                y_assumption.to_numpy(dtype=float),
+                linewidth=2,
+                linestyle="--",
+                color="#c00000",
+                label=assumption_label
+            )
+
+        ax.set_title(str(seg), fontsize=10, weight="bold")
+        ax.grid(axis="y", alpha=0.25)
+
+        if is_percent:
+            if percent_input == "decimal":
+                ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+            elif percent_input == "whole":
+                ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=100.0))
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        ax.tick_params(axis="x", rotation=45)
+
+        if show_legend:
+            ax.legend(fontsize=8, frameon=False)
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    for ax in axes[len(segments):]:
+        ax.set_visible(False)
+
+    fig.suptitle(f"{metric_name} by Final PD Segment", fontsize=14, weight="bold", x=0.01, ha="left")
+    plt.tight_layout()
+    plt.show()
+
+
+def plots(df_perf, 
+          performance_col, 
+          grouping_col="PD_Model_Score_Decile",
+          percentage = False,
+          moving_average_window = 1,
+          trim_last_n = 0):
+    pivot = df_perf.pivot_table(
+                                        index="Data_Cut_Off_Date",
+                                        columns=grouping_col,
+                                        values=performance_col,
+                                        aggfunc="max"
+                                    )
+    title = performance_col + " by Final PD Segment (Worst to Best: 1.0 - 10.0)"
+    if moving_average_window > 0:
+        title = title + ' (Moving Average ' + str(int(moving_average_window)) + ' Months)'
+    plot_finance_style(
+                        pivot,
+                        title=title,
+                        ylabel=performance_col,
+                        percentage=percentage,
+                        decimal=2,
+                        data_labels=False,
+                        figsize=(12, 6),
+                        legend_location="upper left",
+                        moving_average_window=moving_average_window,
+                        trim_last_n = trim_last_n
+
+                    )
+    
+    return pivot

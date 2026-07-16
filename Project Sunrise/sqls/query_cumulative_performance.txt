@@ -1,0 +1,278 @@
+/*
+Project Sunrise cumulative performance curves from cleaned dynamic fields.
+
+Definitions:
+- CGL = cumulative gross loss / original balance
+- CNL = cumulative net loss / original balance
+- MDR = monthly default rate = chargeoff_mtd / BOM
+- CDR = annualized MDR = 1 - (1 - MDR)^12
+- SMM = single-month mortality = prepayment_mtd / (BOM - scheduled_principal_proxy)
+- CPR = annualized SMM = 1 - (1 - SMM)^12
+
+The cumulative CDR/CPR columns are annualized life-to-date averages through each MOC:
+1 - PRODUCT(1 - monthly_rate) ^ (12 / period_count).
+
+CPR note:
+Quantum_TermLoan_Dynamic does not have a separate cleaned scheduled-principal field.
+This query estimates scheduled principal as:
+SCHEDULED_PAYMENT_AMOUNT_MTD - paid_interest_amount_mtd_clean
+and floors both scheduled principal and prepayment at zero.
+*/
+
+WITH account_dim AS (
+    SELECT
+        ACCOUNT_ID,
+        MIN(SNAPSHOT_DATE) AS first_snapshot_date,
+        MIN(CASE WHEN COALESCE(funded_amount_mtd_clean, 0) > 0 THEN SNAPSHOT_DATE END) AS first_funding_date,
+        MIN(CASE WHEN COALESCE(funded_amount_mtd_clean, 0) > 0 THEN MOC END) AS first_funding_moc,
+        MIN(COMMITTED_QUARTER_NAME) AS committed_quarter_name,
+        COALESCE(
+            NULLIF(MAX(COALESCE(BOOKED_AMOUNT, 0)), 0),
+            NULLIF(SUM(COALESCE(funded_amount_mtd_clean, 0)), 0),
+            NULLIF(MAX(COALESCE(eom_bal, 0)), 0)
+        ) AS original_balance
+    FROM [ConsumerLoans].[dbo].[Quantum_TermLoan_Dynamic]
+    GROUP BY ACCOUNT_ID
+),
+account_base AS (
+    SELECT
+        ACCOUNT_ID,
+        COALESCE(first_funding_date, first_snapshot_date) AS vintage_date,
+        CAST(
+            YEAR(COALESCE(first_funding_date, first_snapshot_date)) * 100
+            + MONTH(COALESCE(first_funding_date, first_snapshot_date))
+            AS INT
+        ) AS vintage_month,
+        CONCAT(
+            YEAR(COALESCE(first_funding_date, first_snapshot_date)),
+            'Q',
+            DATEPART(QUARTER, COALESCE(first_funding_date, first_snapshot_date))
+        ) AS vintage_quarter,
+        committed_quarter_name,
+        original_balance
+    FROM account_dim
+    WHERE COALESCE(original_balance, 0) > 0
+),
+moc_calendar AS (
+    SELECT DISTINCT
+        MOC
+    FROM [ConsumerLoans].[dbo].[Quantum_TermLoan_Dynamic]
+    WHERE MOC IS NOT NULL
+      AND MOC >= 0
+),
+account_moc AS (
+    SELECT
+        a.ACCOUNT_ID,
+        a.vintage_date,
+        a.vintage_month,
+        a.vintage_quarter,
+        a.committed_quarter_name,
+        a.original_balance,
+        m.MOC
+    FROM account_base a
+    CROSS JOIN moc_calendar m
+),
+loan_period_base AS (
+    SELECT
+        q.ACCOUNT_ID,
+        q.SNAPSHOT_DATE,
+        q.MOC,
+        COALESCE(q.bom_bal, 0) AS bom_bal,
+        COALESCE(q.eom_bal, 0) AS eom_bal,
+        COALESCE(q.funded_amount_mtd_clean, 0) AS funded_amount_mtd_clean,
+        COALESCE(q.chargeoff_amount_mtd_clean, 0) AS chargeoff_amount_mtd_clean,
+        COALESCE(q.recovery_amount_mtd_clean, 0) AS recovery_amount_mtd_clean,
+        COALESCE(q.paid_principal_amount_mtd_clean, 0) AS paid_principal_amount_mtd_clean,
+        CASE
+            WHEN COALESCE(q.SCHEDULED_PAYMENT_AMOUNT_MTD, 0)
+               - COALESCE(q.paid_interest_amount_mtd_clean, 0) > 0
+            THEN COALESCE(q.SCHEDULED_PAYMENT_AMOUNT_MTD, 0)
+               - COALESCE(q.paid_interest_amount_mtd_clean, 0)
+            ELSE 0
+        END AS scheduled_principal_proxy
+    FROM [ConsumerLoans].[dbo].[Quantum_TermLoan_Dynamic] q
+    WHERE q.MOC IS NOT NULL
+      AND q.MOC >= 0
+),
+loan_period AS (
+    SELECT
+        *,
+        CASE
+            WHEN paid_principal_amount_mtd_clean - scheduled_principal_proxy > 0
+            THEN paid_principal_amount_mtd_clean - scheduled_principal_proxy
+            ELSE 0
+        END AS prepayment_amount_mtd_clean
+    FROM loan_period_base
+),
+loan_period_cumulative AS (
+    SELECT
+        *,
+        SUM(chargeoff_amount_mtd_clean) OVER (
+            PARTITION BY ACCOUNT_ID
+            ORDER BY MOC, SNAPSHOT_DATE
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_gross_loss_amount,
+        SUM(recovery_amount_mtd_clean) OVER (
+            PARTITION BY ACCOUNT_ID
+            ORDER BY MOC, SNAPSHOT_DATE
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_recovery_amount_calc,
+        SUM(prepayment_amount_mtd_clean) OVER (
+            PARTITION BY ACCOUNT_ID
+            ORDER BY MOC, SNAPSHOT_DATE
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_prepayment_amount
+    FROM loan_period
+),
+period_rollup AS (
+    SELECT
+        am.vintage_month,
+        am.vintage_quarter,
+        am.committed_quarter_name,
+        am.MOC,
+        COUNT(DISTINCT am.ACCOUNT_ID) AS loan_count,
+        SUM(am.original_balance) AS original_balance,
+        SUM(COALESCE(lp.bom_bal, 0)) AS bom_bal,
+        SUM(COALESCE(lp.eom_bal, 0)) AS eom_bal,
+        SUM(COALESCE(lp.funded_amount_mtd_clean, 0)) AS funded_amount_mtd,
+        SUM(COALESCE(lp.chargeoff_amount_mtd_clean, 0)) AS gross_loss_mtd,
+        SUM(COALESCE(lp.recovery_amount_mtd_clean, 0)) AS recovery_mtd,
+        SUM(COALESCE(lp.chargeoff_amount_mtd_clean, 0))
+          - SUM(COALESCE(lp.recovery_amount_mtd_clean, 0)) AS net_loss_mtd,
+        SUM(COALESCE(lp.scheduled_principal_proxy, 0)) AS scheduled_principal_proxy_mtd,
+        SUM(COALESCE(lp.prepayment_amount_mtd_clean, 0)) AS prepayment_mtd,
+        SUM(COALESCE(asof_perf.cumulative_gross_loss_amount, 0)) AS cumulative_gross_loss_amount,
+        SUM(COALESCE(asof_perf.cumulative_recovery_amount_calc, 0)) AS cumulative_recovery_amount,
+        SUM(COALESCE(asof_perf.cumulative_gross_loss_amount, 0))
+          - SUM(COALESCE(asof_perf.cumulative_recovery_amount_calc, 0)) AS cumulative_net_loss_amount,
+        SUM(COALESCE(asof_perf.cumulative_prepayment_amount, 0)) AS cumulative_prepayment_amount
+    FROM account_moc am
+    LEFT JOIN loan_period lp
+        ON am.ACCOUNT_ID = lp.ACCOUNT_ID
+       AND am.MOC = lp.MOC
+    OUTER APPLY (
+        SELECT TOP 1
+            lpc.cumulative_gross_loss_amount,
+            lpc.cumulative_recovery_amount_calc,
+            lpc.cumulative_prepayment_amount
+        FROM loan_period_cumulative lpc
+        WHERE lpc.ACCOUNT_ID = am.ACCOUNT_ID
+          AND lpc.MOC <= am.MOC
+        ORDER BY lpc.MOC DESC, lpc.SNAPSHOT_DATE DESC
+    ) asof_perf
+    GROUP BY
+        am.vintage_month,
+        am.vintage_quarter,
+        am.committed_quarter_name,
+        am.MOC
+),
+monthly_rates AS (
+    SELECT
+        *,
+        gross_loss_mtd / NULLIF(bom_bal, 0) AS mdr,
+        prepayment_mtd / NULLIF(
+            CASE
+                WHEN bom_bal - scheduled_principal_proxy_mtd > 0
+                THEN bom_bal - scheduled_principal_proxy_mtd
+                ELSE 0
+            END,
+            0
+        ) AS smm,
+        cumulative_gross_loss_amount / NULLIF(original_balance, 0) AS cumulative_cgl,
+        cumulative_net_loss_amount / NULLIF(original_balance, 0) AS cumulative_cnl
+    FROM period_rollup
+),
+annualized_rates AS (
+    SELECT
+        *,
+        CASE
+            WHEN mdr IS NULL THEN NULL
+            WHEN mdr >= 1 THEN 1.0
+            WHEN mdr <= 0 THEN 0.0
+            ELSE 1 - POWER(1 - mdr, 12)
+        END AS cdr,
+        CASE
+            WHEN smm IS NULL THEN NULL
+            WHEN smm >= 1 THEN 1.0
+            WHEN smm <= 0 THEN 0.0
+            ELSE 1 - POWER(1 - smm, 12)
+        END AS cpr
+    FROM monthly_rates
+),
+cumulative_rate_inputs AS (
+    SELECT
+        *,
+        COUNT(*) OVER (
+            PARTITION BY vintage_month, vintage_quarter, committed_quarter_name
+            ORDER BY MOC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS period_count,
+        SUM(CASE WHEN COALESCE(mdr, 0) >= 1 THEN 1 ELSE 0 END) OVER (
+            PARTITION BY vintage_month, vintage_quarter, committed_quarter_name
+            ORDER BY MOC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_full_default_months,
+        SUM(CASE
+                WHEN COALESCE(mdr, 0) > 0 AND COALESCE(mdr, 0) < 1
+                THEN LOG(1 - mdr)
+                ELSE 0
+            END) OVER (
+            PARTITION BY vintage_month, vintage_quarter, committed_quarter_name
+            ORDER BY MOC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_log_default_survival,
+        SUM(CASE WHEN COALESCE(smm, 0) >= 1 THEN 1 ELSE 0 END) OVER (
+            PARTITION BY vintage_month, vintage_quarter, committed_quarter_name
+            ORDER BY MOC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_full_prepay_months,
+        SUM(CASE
+                WHEN COALESCE(smm, 0) > 0 AND COALESCE(smm, 0) < 1
+                THEN LOG(1 - smm)
+                ELSE 0
+            END) OVER (
+            PARTITION BY vintage_month, vintage_quarter, committed_quarter_name
+            ORDER BY MOC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_log_prepay_survival
+    FROM annualized_rates
+)
+SELECT
+    vintage_month,
+    vintage_quarter,
+    committed_quarter_name,
+    MOC,
+    loan_count,
+    original_balance,
+    bom_bal,
+    eom_bal,
+    funded_amount_mtd,
+    gross_loss_mtd,
+    recovery_mtd,
+    net_loss_mtd,
+    scheduled_principal_proxy_mtd,
+    prepayment_mtd,
+    cumulative_gross_loss_amount,
+    cumulative_recovery_amount,
+    cumulative_net_loss_amount,
+    cumulative_prepayment_amount,
+    cumulative_cgl,
+    cumulative_cnl,
+    mdr,
+    cdr,
+    smm,
+    cpr,
+    CASE
+        WHEN cumulative_full_default_months > 0 THEN 1.0
+        WHEN period_count > 0 THEN 1 - EXP(cumulative_log_default_survival * 12.0 / period_count)
+        ELSE NULL
+    END AS cumulative_cdr,
+    CASE
+        WHEN cumulative_full_prepay_months > 0 THEN 1.0
+        WHEN period_count > 0 THEN 1 - EXP(cumulative_log_prepay_survival * 12.0 / period_count)
+        ELSE NULL
+    END AS cumulative_cpr
+FROM cumulative_rate_inputs
+ORDER BY
+    vintage_month,
+    MOC;

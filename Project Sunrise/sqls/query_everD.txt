@@ -1,0 +1,120 @@
+DECLARE @target_moc INT = TARGET_MOC;
+DECLARE @ever_d_days INT = EVER_D_DAYS;
+
+WITH eligible_static AS (
+    SELECT
+        *,
+        COALESCE(First_Funding_Date, Committed_Date) AS funding_date_clean
+    FROM [ConsumerLoans].[dbo].[Quantum_Static]
+    WHERE Sub_Product_Type = 'Term Loan'
+      AND (APR <= 0.36 OR APR IS NULL)
+),
+ever_event AS (
+    SELECT
+        q.ACCOUNT_ID,
+        MAX(CASE
+                WHEN q.MOC <= @target_moc
+                 AND (
+                        q.DAYS_PAST_DUE >= @ever_d_days
+                     OR COALESCE(q.has_been_co, 0) = 1
+                     OR COALESCE(q.chargeoff_amount_mtd_clean, 0) > 0
+                     )
+                THEN 1
+                ELSE 0
+            END) AS everD_or_CO_flag
+    FROM [ConsumerLoans].[dbo].[Quantum_TermLoan_Dynamic] q
+    JOIN eligible_static s
+        ON q.ACCOUNT_ID = s.ACCOUNT_ID
+    WHERE q.MOC <= @target_moc
+    GROUP BY q.ACCOUNT_ID
+),
+latest_dynamic AS (
+    SELECT
+        q.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY q.ACCOUNT_ID
+            ORDER BY q.MOC DESC, q.SNAPSHOT_DATE DESC
+        ) AS rn
+    FROM [ConsumerLoans].[dbo].[Quantum_TermLoan_Dynamic] q
+    JOIN eligible_static s
+        ON q.ACCOUNT_ID = s.ACCOUNT_ID
+    WHERE q.MOC <= @target_moc
+),
+last_reported_dynamic AS (
+    SELECT
+        q.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY q.ACCOUNT_ID
+            ORDER BY q.SNAPSHOT_DATE DESC, q.MOC DESC
+        ) AS rn
+    FROM [ConsumerLoans].[dbo].[Quantum_TermLoan_Dynamic] q
+    JOIN eligible_static s
+        ON q.ACCOUNT_ID = s.ACCOUNT_ID
+),
+scheduled_payment_counts AS (
+    SELECT
+        q.ACCOUNT_ID,
+        ROUND(q.scheduled_payment_per_period, 2) AS scheduled_payment_per_period,
+        COUNT(*) AS scheduled_payment_report_count,
+        MIN(q.MOC) AS scheduled_payment_first_reported_moc,
+        MIN(q.SNAPSHOT_DATE) AS scheduled_payment_first_reported_snapshot_date
+    FROM [ConsumerLoans].[dbo].[Quantum_TermLoan_Dynamic] q
+    JOIN eligible_static s
+        ON q.ACCOUNT_ID = s.ACCOUNT_ID
+    WHERE q.scheduled_payment_per_period IS NOT NULL
+      AND q.scheduled_payment_per_period > 0
+    GROUP BY
+        q.ACCOUNT_ID,
+        ROUND(q.scheduled_payment_per_period, 2)
+),
+loan_scheduled_payment AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY ACCOUNT_ID
+            ORDER BY
+                scheduled_payment_report_count DESC,
+                scheduled_payment_first_reported_moc,
+                scheduled_payment_first_reported_snapshot_date,
+                scheduled_payment_per_period DESC
+        ) AS rn
+    FROM scheduled_payment_counts
+)
+
+SELECT
+    s.*,
+    s.Gross_Origination_Fees / s.Booked_Amount * 100 AS Gross_Origination_Fees_pct,
+    s.Partner_Fees / s.Booked_Amount * 100 AS Partner_Fees_pct,
+    s.Net_Fees / s.Booked_Amount * 100 AS Net_Fees_pct,
+    CAST(YEAR(s.funding_date_clean) * 100 + MONTH(s.funding_date_clean) AS INT) AS vintage_month,
+    CONCAT(YEAR(s.funding_date_clean), 'Q', DATEPART(QUARTER, s.funding_date_clean)) AS vintage_quarter,
+    q.SNAPSHOT_DATE,
+    q.MOC,
+    q.LOAN_STATUS,
+    q.bom_bal,
+    q.eom_bal,
+--    q.DAYS_PAST_DUE,
+    q.has_been_co,
+    q.cumulative_chargeoff_amount,
+    q.cumulative_recovery_amount,
+    lr.SNAPSHOT_DATE AS last_reported_snapshot_date,
+    lr.MOC AS last_reported_moc,
+    lr.eom_bal AS last_reported_eom_bal,
+    lr.LOAN_STATUS AS last_reported_status,
+    sp.scheduled_payment_per_period,
+    sp.scheduled_payment_report_count,
+    sp.scheduled_payment_first_reported_moc,
+    COALESCE(e.everD_or_CO_flag, 0) AS everD60_or_CO
+    
+FROM eligible_static s
+LEFT JOIN latest_dynamic q
+    ON s.ACCOUNT_ID = q.ACCOUNT_ID
+   AND q.rn = 1
+LEFT JOIN last_reported_dynamic lr
+    ON s.ACCOUNT_ID = lr.ACCOUNT_ID
+   AND lr.rn = 1
+LEFT JOIN ever_event e
+    ON s.ACCOUNT_ID = e.ACCOUNT_ID
+LEFT JOIN loan_scheduled_payment sp
+    ON s.ACCOUNT_ID = sp.ACCOUNT_ID
+   AND sp.rn = 1;

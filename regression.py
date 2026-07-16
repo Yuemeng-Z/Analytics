@@ -305,6 +305,48 @@ def sort_spline_by_var(df, spline_features=None):
 
     return df
 
+def order_coef_categories_by_count(
+    coef_df,
+    categorical_features,
+    count_rank_features=None,
+    other_label="Other",
+):
+    if not count_rank_features:
+        return coef_df
+
+    coef_df = coef_df.copy()
+    count_rank_features = set(count_rank_features)
+    ordered_parts = []
+    used_indexes = set()
+
+    for col in categorical_features:
+        prefix = f"{col}_"
+        col_mask = coef_df["Feature"].astype(str).str.startswith(prefix)
+        col_rows = coef_df.loc[col_mask].copy()
+
+        if col_rows.empty:
+            continue
+
+        used_indexes.update(col_rows.index)
+
+        if col in count_rank_features:
+            col_rows["_category_value"] = col_rows["Feature"].astype(str).str[len(prefix):]
+            col_rows["_other_rank"] = np.where(col_rows["_category_value"] == other_label, 0, 1)
+            col_rows["_count_sort"] = pd.to_numeric(col_rows["Count"], errors="coerce").fillna(-1)
+            col_rows["_orig_order"] = range(len(col_rows))
+            col_rows = col_rows.sort_values(
+                ["_other_rank", "_count_sort", "_orig_order"],
+                ascending=[True, False, True],
+            ).drop(columns=["_category_value", "_other_rank", "_count_sort", "_orig_order"])
+
+        ordered_parts.append(col_rows)
+
+    remaining_rows = coef_df.loc[[idx for idx in coef_df.index if idx not in used_indexes]]
+    if ordered_parts:
+        return pd.concat(ordered_parts + [remaining_rows], ignore_index=True)
+
+    return coef_df
+
 # =========================
 # AUTO BASELINE SELECTION
 # =========================
@@ -405,8 +447,35 @@ def plot_feature_importance(coef_df, top_n=15):
 def create_spline_features_inputs(df, 
                                   piecewise_features,
                                   percentiles=[10,30,50,70,90]):
+    
+    missing_summary = (
+        df[piecewise_features]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .isna()
+        .sum()
+        .to_frame("missing_count")
+    )
+
+    missing_summary["missing_pct"] = missing_summary["missing_count"] / len(df)
+    if len(missing_summary[missing_summary["missing_count"] > 0].sort_values("missing_count", ascending=False)) > 0:
+        print(missing_summary[missing_summary["missing_count"] > 0].sort_values("missing_count", ascending=False))
+
+        fill_cols = piecewise_features
+
+        df[fill_cols] = (
+            df[fill_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+        fill_values = df[fill_cols].mean()
+
+        df[fill_cols] = df[fill_cols].fillna(fill_values)
+
     # Create a dictionary to store percentiles for each variable
     percentile_dict = {}
+
 
     for column in piecewise_features:
         percentiles_for_variable = []
@@ -449,6 +518,12 @@ def train_model(
     cat_categories = []
     cat_drop = []
 
+    def _rank_other_first(categories):
+        categories = list(categories)
+        if "Other" in categories:
+            categories = ["Other"] + [category for category in categories if category != "Other"]
+        return categories
+
     for col in categorical_features:
 
         categories = list(X_train[col].dropna().astype("category").cat.categories)
@@ -456,6 +531,7 @@ def train_model(
         # ensure "Other" included if exists
         if "Other" in X_train[col].values and "Other" not in categories:
             categories.append("Other")
+        categories = _rank_other_first(categories)
 
         if col in manual_baseline:
             best = manual_baseline[col]
@@ -562,7 +638,9 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
                     plot=True,
                     plot_top_n_features = 15,
                     adjust_logistic_decision_threshold=None,
-                    intercept_multiplier=1.0):  
+                    intercept_multiplier=1.0,
+                    coef_count_rank_features=None,
+                    coef_other_label="Other"):  
 
     preprocessor = pipeline.named_steps["preprocess"]
     model = pipeline.named_steps["model"]
@@ -599,22 +677,15 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
         categories = encoder.categories_[col_idx]
         value_counts = X_cat[col].value_counts()
 
-        if encoder.drop_idx_ is not None:
-            baseline_idx = encoder.drop_idx_[col_idx]
-            baseline = categories[baseline_idx]
-        else:
-            baseline = None
-
-        rows.append({
-            "Feature": f"{col}_{baseline}",
-            "Coefficient": 0.0,
-            "Count": value_counts.get(baseline, 0)
-        })
-
-        # other categories
         for i, val in enumerate(categories):
             if encoder.drop_idx_ is not None and i == encoder.drop_idx_[col_idx]:
+                rows.append({
+                    "Feature": f"{col}_{str(val)}",
+                    "Coefficient": 0.0,
+                    "Count": value_counts.get(val, 0)
+                })
                 continue
+
             rows.append({
                 "Feature": f"{col}_{str(val)}",
                 "Coefficient": next(coef_iter),
@@ -624,6 +695,8 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
     # =========================
     # ADD REMAINING FEATURES (NUMERIC + SPLINE)
     # =========================
+
+    numeric_feature_set = set(numeric_features or [])
 
     # Get transformed matrix
     X_transformed = preprocessor.transform(X)
@@ -645,7 +718,10 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
         # IMPORTANT: include ALL features (including missing)
         col_values = X_transformed[clean_name]
 
-        count = sum(col_values)
+        if clean_name in numeric_feature_set and clean_name in X.columns:
+            count = X[clean_name].notna().sum()
+        else:
+            count = sum(col_values)
 
         rows.append({
             "Feature": clean_name,
@@ -767,6 +843,12 @@ def summarize_model(pipeline, X, y, categorical_features, numeric_features,
             plt.tight_layout()
             plt.show()
 
+    coef_df = order_coef_categories_by_count(
+        coef_df,
+        categorical_features,
+        count_rank_features=coef_count_rank_features,
+        other_label=coef_other_label,
+    )
     coef_df = sort_spline_by_var(coef_df, spline_features)
     front_cols = [
         col for col in ["Feature", "Coefficient", "Count", "P Value"]
@@ -835,12 +917,14 @@ def run_model_pipeline(df,
                        max_categories=10,
                        random_state=42,
                        plot=True,
-                       output_coef=False,
-                       output_file_name="Regression_Coefficients.xlsx",
-                       plot_top_n_features = 25,
-                       id_col=None,
-                       adjust_logistic_decision_threshold=None,
+    output_coef=False,
+    output_file_name="Regression_Coefficients.xlsx",
+    plot_top_n_features = 25,
+    id_col=None,
+    adjust_logistic_decision_threshold=None,
                        intercept_multiplier=1.0,
+                       coef_count_rank_features=None,
+                       coef_other_label="Other",
                        only_plot_corr = False
                        ):
 
@@ -946,7 +1030,9 @@ def run_model_pipeline(df,
                                             plot=plot,
                                             plot_top_n_features=plot_top_n_features,
                                             adjust_logistic_decision_threshold=adjust_logistic_decision_threshold,
-                                            intercept_multiplier = intercept_multiplier
+                                            intercept_multiplier = intercept_multiplier,
+                                            coef_count_rank_features=coef_count_rank_features,
+                                            coef_other_label=coef_other_label
                                         )
     
     X_train_with_preds = X_train.copy()
@@ -1030,7 +1116,9 @@ def run_model_pipeline(df,
         "X_train_with_preds": X_train_with_preds,
         "outofsample_results": results,
         "X_test_with_preds": X_test_with_preds if do_oos else None,
-        "has_oos": do_oos
+        "has_oos": do_oos,
+        "category_maps": category_maps,
+        "spline_drop": spline_drop,
     }
 
 
@@ -1054,6 +1142,7 @@ def run_residual_layer_pipeline(
     test_target_col=None,
     max_categories=10,
     residual_max_categories=None,
+    residual_train_filter=None,
     random_state=42,
     plot=True,
     output_coef=False,
@@ -1063,10 +1152,15 @@ def run_residual_layer_pipeline(
     id_col=None,
     adjust_logistic_decision_threshold=None,
     intercept_multiplier=1.0,
+    base_coef_count_rank_features=None,
+    residual_coef_count_rank_features=None,
+    coef_other_label="Other",
     residual_col="stage1_residual",
     stage1_pred_col="stage1_pred",
     stage2_pred_col="stage2_residual_pred",
     combined_pred_col="combined_pred",
+    stage1_log_odds_col="stage1_log_odds",
+    log_odds_epsilon=1e-6,
     clip_combined_pred=True
 ):
     """
@@ -1079,6 +1173,46 @@ def run_residual_layer_pipeline(
         if residual_max_categories is not None
         else max_categories
     )
+    logistic_rescore_stage2 = residual_model_type == "logistic"
+
+    if logistic_rescore_stage2 and base_model_type != "logistic":
+        raise ValueError("residual_model_type='logistic' requires base_model_type='logistic'.")
+
+    def _safe_log_odds(pred_values):
+        p = np.clip(
+            np.asarray(pred_values, dtype="float64"),
+            log_odds_epsilon,
+            1 - log_odds_epsilon,
+        )
+        return np.log(p / (1 - p))
+
+    stage2_numeric_features = list(residual_numeric_features)
+    if logistic_rescore_stage2 and stage1_log_odds_col not in stage2_numeric_features:
+        stage2_numeric_features.append(stage1_log_odds_col)
+
+    stage2_target_col = target_col if logistic_rescore_stage2 else residual_col
+
+    def apply_residual_train_filter(stage2_df):
+        if residual_train_filter is None:
+            return stage2_df.copy()
+
+        if isinstance(residual_train_filter, str):
+            return stage2_df.query(residual_train_filter).copy()
+
+        if callable(residual_train_filter):
+            filter_result = residual_train_filter(stage2_df)
+        else:
+            filter_result = residual_train_filter
+
+        if isinstance(filter_result, pd.DataFrame):
+            return filter_result.copy()
+
+        if isinstance(filter_result, pd.Series):
+            mask = filter_result.reindex(stage2_df.index).fillna(False).astype(bool)
+        else:
+            mask = pd.Series(filter_result, index=stage2_df.index).fillna(False).astype(bool)
+
+        return stage2_df.loc[mask].copy()
 
     stage1_results = run_model_pipeline(
         df=df,
@@ -1100,16 +1234,25 @@ def run_residual_layer_pipeline(
         plot_top_n_features=plot_top_n_features,
         id_col=id_col,
         adjust_logistic_decision_threshold=adjust_logistic_decision_threshold,
-        intercept_multiplier=intercept_multiplier
+        intercept_multiplier=intercept_multiplier,
+        coef_count_rank_features=base_coef_count_rank_features,
+        coef_other_label=coef_other_label
     )
 
     def build_residual_df(source_df, preds_df):
         out = source_df.loc[preds_df.index].copy()
         out[stage1_pred_col] = preds_df["y_pred"].to_numpy()
-        out[residual_col] = (
-            preds_df["y_true"].to_numpy()
-            - preds_df["y_pred"].to_numpy()
-        )
+
+        if logistic_rescore_stage2:
+            out[residual_col] = np.nan
+            out[stage1_log_odds_col] = _safe_log_odds(out[stage1_pred_col])
+            out[stage2_target_col] = preds_df["y_true"].to_numpy()
+        else:
+            out[residual_col] = (
+                preds_df["y_true"].to_numpy()
+                - preds_df["y_pred"].to_numpy()
+            )
+
         return out
 
     stage2_train_df = build_residual_df(
@@ -1125,11 +1268,15 @@ def run_residual_layer_pipeline(
             stage1_results["X_test_with_preds"]
         )
 
+    stage2_fit_df = apply_residual_train_filter(stage2_train_df)
+    if stage2_fit_df.empty:
+        raise ValueError("residual_train_filter produced an empty residual training dataset.")
+
     stage2_results = run_model_pipeline(
-        df=stage2_train_df,
-        target_col=residual_col,
+        df=stage2_fit_df,
+        target_col=stage2_target_col,
         categorical_features=residual_categorical_features,
-        numeric_features=residual_numeric_features,
+        numeric_features=stage2_numeric_features,
         spline_features=residual_spline_features,
         manual_baseline=residual_manual_baseline,
         spline_manual_baseline=residual_spline_manual_baseline,
@@ -1142,21 +1289,69 @@ def run_residual_layer_pipeline(
         output_coef=output_coef,
         output_file_name=residual_output_file_name,
         plot_top_n_features=plot_top_n_features,
-        id_col=id_col
+        id_col=id_col,
+        coef_count_rank_features=residual_coef_count_rank_features,
+        coef_other_label=coef_other_label
+    )
+
+    def predict_stage2_residuals(source_df):
+        spline_vars = list(residual_spline_features.keys()) if residual_spline_features else []
+        feature_cols = residual_categorical_features + stage2_numeric_features + spline_vars
+        X_pred = source_df[feature_cols].copy()
+        X_pred = clean_numeric_data(X_pred, stage2_numeric_features)
+        X_pred = apply_category_mapping(
+            X_pred,
+            residual_categorical_features,
+            stage2_results["category_maps"]
+        )
+
+        pipeline = stage2_results["pipeline"]
+        if residual_model_type == "logistic":
+            pred_values = pipeline.predict_proba(X_pred)[:, 1]
+        else:
+            pred_values = pipeline.predict(X_pred)
+
+        out = X_pred.copy()
+        if id_col and id_col in source_df.columns:
+            out[id_col] = source_df[id_col]
+
+        if residual_col in source_df.columns:
+            out[residual_col] = source_df[residual_col].to_numpy()
+
+        out["y_true"] = source_df[stage2_target_col].to_numpy()
+        out["y_pred"] = pred_values
+        return out
+
+    stage2_train_preds_full = predict_stage2_residuals(stage2_train_df)
+    stage2_test_preds_full = (
+        predict_stage2_residuals(stage2_test_df)
+        if stage2_test_df is not None
+        else None
     )
 
     def build_combined_preds(stage1_preds_df, stage2_preds_df):
-        combined = stage2_preds_df.copy().rename(
-            columns={
-                "y_true": residual_col,
-                "y_pred": stage2_pred_col
-            }
-        )
+        if logistic_rescore_stage2:
+            combined = stage2_preds_df.copy().rename(
+                columns={"y_pred": stage2_pred_col}
+            )
+            combined = combined.drop(columns=["y_true"], errors="ignore")
+        else:
+            combined = stage2_preds_df.copy().rename(
+                columns={
+                    "y_true": residual_col,
+                    "y_pred": stage2_pred_col
+                }
+            )
+
         combined["y_true"] = stage1_preds_df["y_true"].to_numpy()
         combined[stage1_pred_col] = stage1_preds_df["y_pred"].to_numpy()
-        combined[combined_pred_col] = (
-            combined[stage1_pred_col] + combined[stage2_pred_col]
-        )
+
+        if logistic_rescore_stage2:
+            combined[combined_pred_col] = combined[stage2_pred_col]
+        else:
+            combined[combined_pred_col] = (
+                combined[stage1_pred_col] + combined[stage2_pred_col]
+            )
 
         if clip_combined_pred and base_model_type == "logistic":
             combined[combined_pred_col] = combined[combined_pred_col].clip(0, 1)
@@ -1166,14 +1361,14 @@ def run_residual_layer_pipeline(
 
     combined_train_with_preds = build_combined_preds(
         stage1_results["X_train_with_preds"],
-        stage2_results["X_train_with_preds"]
+        stage2_train_preds_full
     )
 
     combined_test_with_preds = None
     if stage1_results["has_oos"]:
         combined_test_with_preds = build_combined_preds(
             stage1_results["X_test_with_preds"],
-            stage2_results["X_test_with_preds"]
+            stage2_test_preds_full
         )
 
     def score_combined(preds_df, prefix):
@@ -1218,10 +1413,21 @@ def run_residual_layer_pipeline(
         "combined_train_with_preds": combined_train_with_preds,
         "combined_test_with_preds": combined_test_with_preds,
         "combined_results": combined_results,
+        "stage2_fit_df": stage2_fit_df,
+        "stage2_train_df": stage2_train_df,
+        "stage2_train_preds_full": stage2_train_preds_full,
+        "stage2_test_preds_full": stage2_test_preds_full,
         "residual_col": residual_col,
         "stage1_pred_col": stage1_pred_col,
         "stage2_pred_col": stage2_pred_col,
-        "combined_pred_col": combined_pred_col
+        "combined_pred_col": combined_pred_col,
+        "stage1_log_odds_col": stage1_log_odds_col,
+        "log_odds_epsilon": log_odds_epsilon,
+        "stage2_target_col": stage2_target_col,
+        "stage2_numeric_features": stage2_numeric_features,
+        "logistic_rescore_stage2": logistic_rescore_stage2,
+        "base_model_type": base_model_type,
+        "residual_model_type": residual_model_type,
     }
 
 
@@ -1316,65 +1522,80 @@ def auc_drop_test(df_training,
     return res_df
 
 
+def get_prediction_results(in_sample_outputs, 
+                            df_origination, 
+                            orig_bal_col_name, 
+                            id_col_name,
+                            vintage_col_name,
+                            fit_resid = False):
+    if orig_bal_col_name not in in_sample_outputs.columns:
+        in_sample_outputs = in_sample_outputs.merge(df_origination[[id_col_name, vintage_col_name, orig_bal_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
+    else:
+        in_sample_outputs = in_sample_outputs.merge(df_origination[[id_col_name, vintage_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
+
+    in_sample_outputs['Empirical Amount'] = in_sample_outputs.loc[:, 'y_true'] * in_sample_outputs.loc[:, orig_bal_col_name]
+    if not fit_resid:
+        in_sample_outputs['Model Results Amount'] = in_sample_outputs.loc[:, 'y_pred'] * in_sample_outputs.loc[:, orig_bal_col_name]
+        output = in_sample_outputs.groupby([vintage_col_name]).sum()[[orig_bal_col_name, 'Empirical Amount', 'Model Results Amount']]
+        output['Empirical'] = output['Empirical Amount'] / output[orig_bal_col_name]
+        output['Model Results'] = output['Model Results Amount'] / output[orig_bal_col_name]
+    else:
+        in_sample_outputs['Model Results Amount Stage 1'] = in_sample_outputs.loc[:, 'stage1_pred'] * in_sample_outputs.loc[:, orig_bal_col_name]
+        in_sample_outputs['Model Results Amount Stage 2'] = in_sample_outputs.loc[:, 'y_pred'] * in_sample_outputs.loc[:, orig_bal_col_name]
+        output = in_sample_outputs.groupby([vintage_col_name]).sum()[[orig_bal_col_name, 'Empirical Amount', 'Model Results Amount Stage 1', 'Model Results Amount Stage 2']]
+        output['Empirical'] = output['Empirical Amount'] / output[orig_bal_col_name]
+        output['Model Results Stage 1'] = output['Model Results Amount Stage 1'] / output[orig_bal_col_name]
+        output['Model Results Stage 2'] = output['Model Results Amount Stage 2'] / output[orig_bal_col_name]
+
+    return output
+
+
 def get_table_for_plot_in_sample_vs_oos(results, 
-                                        df_training, 
-                                        df_test, 
                                         df_origination, 
-                                        secondary_y_cols, 
                                         orig_bal_col_name,
                                         id_col_name,
                                         vintage_col_name,
-                                        categorical_col_to_plot = None,
-                                        empirical_col = None
+                                        fit_resid = False
+                                        # secondary_y_cols, 
+                                        # df_test = None, 
+                                        # categorical_col_to_plot = None,
+                                        # empirical_col = None
                                         ):
-                    
-    if empirical_col != None:
-        in_sample_outputs = df_training[[id_col_name, empirical_col]]
-        in_sample_outputs.rename(columns = {empirical_col: 'y_true'},  inplace=True)
+
+    if fit_resid:
+        in_sample_outputs = results['combined_train_with_preds']
+        oos_result = results['combined_test_with_preds']
     else:
         in_sample_outputs = results['X_train_with_preds']
+        oos_result = results['X_test_with_preds']
 
-    oos_result = results['X_test_with_preds']
-    # oos_result = oos_result[oos_result['Credit Rating Bucket'] == 'B']
+    in_sample_outputs = get_prediction_results(in_sample_outputs, df_origination, orig_bal_col_name, id_col_name, vintage_col_name, fit_resid = fit_resid)
 
-    if orig_bal_col_name not in in_sample_outputs.columns:
-        in_sample_outputs = in_sample_outputs.merge(df_training[[id_col_name, vintage_col_name, orig_bal_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
-    else:
-        in_sample_outputs = in_sample_outputs.merge(df_training[[id_col_name, vintage_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
-    in_sample_outputs['Empirical Amount'] = in_sample_outputs.loc[:, 'y_true'] * in_sample_outputs.loc[:, orig_bal_col_name]
-    # print(in_sample_outputs.head())
+    oos_result = get_prediction_results(oos_result, df_origination, orig_bal_col_name, id_col_name, vintage_col_name, fit_resid = fit_resid)    
 
-    if orig_bal_col_name not in oos_result.columns:
-        oos_result = oos_result.merge(df_test[[id_col_name, vintage_col_name, orig_bal_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
-    else:
-        oos_result = oos_result.merge(df_test[[id_col_name, vintage_col_name]], on = id_col_name, how = 'left', suffixes=('', '_added'))
-    oos_result['Model Results Amount'] = oos_result.loc[:, 'y_pred'] * oos_result.loc[:, orig_bal_col_name]
-    print(oos_result.columns)
-    output_oos = oos_result.groupby([vintage_col_name]).sum()[[orig_bal_col_name, 'Model Results Amount']]
-    output_oos['Model Results'] = output_oos['Model Results Amount'] / output_oos[orig_bal_col_name]
+    output = in_sample_outputs.join(oos_result, how='outer', lsuffix='_in_sample', rsuffix='_Out_Of_Sample')
 
-    output = in_sample_outputs.groupby([vintage_col_name]).sum()[[orig_bal_col_name, 'Empirical Amount']]
-    output['Empirical'] = output['Empirical Amount'] / output[orig_bal_col_name]
-    # output = output.apply(trim_last_n, n=trim_n )
+    # output = output.loc[:, ['Booked_Amount_in_sample', 
+    #                         'Empirical_in_sample','Model Results_in_sample', 
+    #                         'Booked_Amount_Out_Of_Sample', 
+    #                         'Empirical_Out_Of_Sample', 'Model Results_Out_Of_Sample']]
 
-    output = output.join(output_oos, how='outer', lsuffix='_in_sample', rsuffix='_oos')
+    # if categorical_col_to_plot:
+    #     percentage_tables = get_wt_distribution(df_origination, 
+    #                                                 secondary_y_cols[0],
+    #                                                 vintage = vintage_col_name,
+    #                                                 weight_by = orig_bal_col_name, show_total_origination = False, format_pct = False).T
+    #     output = output.join(percentage_tables[[categorical_col_to_plot]], how='outer')        
+    #     output_plot = output[['Empirical', 'Model Results'] + [categorical_col_to_plot]]  
+    #     # secondary_ylabel = '{} = {} %'.format(secondary_y_cols[0], 'Yes' if categorical_col_to_plot == 1 else categorical_col_to_plot)
+    #     secondary_y_cols = [categorical_col_to_plot]   
+    #     # secondary_percentage = True                               
+    # else:
+    #     wa_tables = groupby_weighted_avg(df_origination, groupby_col = vintage_col_name, cols = secondary_y_cols, weight_col = orig_bal_col_name)
+    #     output = output.join(wa_tables, how='outer')    
 
-    if categorical_col_to_plot:
-        percentage_tables = get_wt_distribution(df_origination, 
-                                                    secondary_y_cols[0],
-                                                    vintage = vintage_col_name,
-                                                    weight_by = orig_bal_col_name, show_total_origination = False, format_pct = False).T
-        output = output.join(percentage_tables[[categorical_col_to_plot]], how='outer')        
-        output_plot = output[['Empirical', 'Model Results'] + [categorical_col_to_plot]]  
-        # secondary_ylabel = '{} = {} %'.format(secondary_y_cols[0], 'Yes' if categorical_col_to_plot == 1 else categorical_col_to_plot)
-        secondary_y_cols = [categorical_col_to_plot]   
-        # secondary_percentage = True                               
-    else:
-        wa_tables = groupby_weighted_avg(df_origination, groupby_col = vintage_col_name, cols = secondary_y_cols, weight_col = orig_bal_col_name)
-        output = output.join(wa_tables, how='outer')    
-
-        output_plot = output[['Empirical', 'Model Results'] + secondary_y_cols]
-        # secondary_percentage = False
+    #     output_plot = output[['Empirical', 'Model Results'] + secondary_y_cols]
+    #     # secondary_percentage = False
 
     # if secondary_y_cols:
     #     plot_finance_style(
@@ -1403,4 +1624,132 @@ def get_table_for_plot_in_sample_vs_oos(results,
     #                         linestyles_inputs = ['-', '-', '--']
     #                         )
 
-    return output_plot
+    return output
+
+
+
+def score_residual_results_on_new_data(
+    new_df,
+    residual_results,
+    base_categorical_features,
+    base_numeric_features,
+    residual_categorical_features,
+    residual_numeric_features,
+    base_spline_features=None,
+    residual_spline_features=None,
+    id_col="New_Underlying_Exposure_Identifier",
+    base_model_type="logistic",
+    residual_model_type="linear",
+    clip_combined_pred=True,
+):
+    out = new_df.copy()
+
+    base_model_type = residual_results.get("base_model_type", base_model_type)
+    residual_model_type = residual_results.get("residual_model_type", residual_model_type)
+    stage1_pred_col = residual_results.get("stage1_pred_col", "stage1_pred")
+    stage2_pred_col = residual_results.get("stage2_pred_col", "stage2_residual_pred")
+    combined_pred_col = residual_results.get("combined_pred_col", "combined_pred")
+    residual_col = residual_results.get("residual_col", "stage1_residual")
+    stage1_log_odds_col = residual_results.get("stage1_log_odds_col", "stage1_log_odds")
+    log_odds_epsilon = residual_results.get("log_odds_epsilon", 1e-6)
+    logistic_rescore_stage2 = residual_results.get(
+        "logistic_rescore_stage2",
+        residual_model_type == "logistic",
+    )
+
+    if logistic_rescore_stage2 and base_model_type != "logistic":
+        raise ValueError("Logistic stage 2 scoring requires base_model_type='logistic'.")
+
+    stage2_numeric_features = residual_results.get("stage2_numeric_features")
+    if stage2_numeric_features is None:
+        stage2_numeric_features = list(residual_numeric_features)
+        if logistic_rescore_stage2 and stage1_log_odds_col not in stage2_numeric_features:
+            stage2_numeric_features.append(stage1_log_odds_col)
+
+    def _safe_log_odds(pred_values):
+        p = np.clip(
+            np.asarray(pred_values, dtype="float64"),
+            log_odds_epsilon,
+            1 - log_odds_epsilon,
+        )
+        return np.log(p / (1 - p))
+
+    # -----------------------------
+    # Stage 1 score
+    # -----------------------------
+    base_spline_vars = list(base_spline_features.keys()) if base_spline_features else []
+    base_feature_cols = base_categorical_features + base_numeric_features + base_spline_vars
+
+    missing_base_cols = [c for c in base_feature_cols if c not in out.columns]
+    if missing_base_cols:
+        raise ValueError(f"Missing Stage 1 columns: {missing_base_cols}")
+
+    X_base = out[base_feature_cols].copy()
+    X_base = clean_numeric_data(X_base, base_numeric_features)
+    X_base = apply_category_mapping(
+        X_base,
+        base_categorical_features,
+        residual_results["stage1_results"]["category_maps"],
+    )
+
+    stage1_pipeline = residual_results["stage1_results"]["pipeline"]
+
+    if base_model_type == "logistic":
+        stage1_pred = stage1_pipeline.predict_proba(X_base)[:, 1]
+    else:
+        stage1_pred = stage1_pipeline.predict(X_base)
+
+    out[stage1_pred_col] = stage1_pred
+    if logistic_rescore_stage2:
+        out[residual_col] = np.nan
+        out[stage1_log_odds_col] = _safe_log_odds(out[stage1_pred_col])
+
+    # -----------------------------
+    # Stage 2 residual score
+    # -----------------------------
+    residual_spline_vars = list(residual_spline_features.keys()) if residual_spline_features else []
+    residual_feature_cols = (
+        residual_categorical_features
+        + stage2_numeric_features
+        + residual_spline_vars
+    )
+
+    missing_stage2_cols = [c for c in residual_feature_cols if c not in out.columns]
+    if missing_stage2_cols:
+        raise ValueError(f"Missing Stage 2 columns: {missing_stage2_cols}")
+
+    X_resid = out[residual_feature_cols].copy()
+    X_resid = clean_numeric_data(X_resid, stage2_numeric_features)
+    X_resid = apply_category_mapping(
+        X_resid,
+        residual_categorical_features,
+        residual_results["stage2_results"]["category_maps"],
+    )
+
+    stage2_pipeline = residual_results["stage2_results"]["pipeline"]
+
+    if logistic_rescore_stage2:
+        stage2_pred = stage2_pipeline.predict_proba(X_resid)[:, 1]
+    else:
+        stage2_pred = stage2_pipeline.predict(X_resid)
+
+    # -----------------------------
+    # Combined score
+    # -----------------------------
+    out[stage2_pred_col] = stage2_pred
+
+    if logistic_rescore_stage2:
+        out[combined_pred_col] = out[stage2_pred_col]
+    else:
+        out[combined_pred_col] = out[stage1_pred_col] + out[stage2_pred_col]
+
+    if clip_combined_pred and base_model_type == "logistic":
+        out[combined_pred_col] = out[combined_pred_col].clip(0, 1)
+
+    keep_cols = [stage1_pred_col, stage2_pred_col, combined_pred_col]
+    if logistic_rescore_stage2 and stage1_log_odds_col in out.columns:
+        keep_cols = [stage1_log_odds_col] + keep_cols
+    if id_col and id_col in out.columns:
+        keep_cols = [id_col] + keep_cols
+
+    return out, out[keep_cols].copy()
